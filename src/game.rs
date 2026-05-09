@@ -7,8 +7,10 @@ use uuid::Uuid;
 
 pub type Coord = (i32, i32);
 
-pub const DEFAULT_MAP_WIDTH: i32 = 10;
-pub const DEFAULT_MAP_HEIGHT: i32 = 30;
+/// Inclusive bounds for randomly chosen map dimensions. Each seed picks a
+/// width and height inside this box so games vary in size and feel.
+pub const MIN_MAP_DIM: i32 = 8;
+pub const MAX_MAP_DIM: i32 = 15;
 /// Generated maps must have at least this many vertex-disjoint land paths
 /// between the two HQs. Stops the random generator from producing maps with a
 /// single chokepoint that the better-positioned player can lock down.
@@ -267,17 +269,16 @@ impl Map {
     }
 }
 
-/// Generate a random map deterministically from `rng`, mirrored across the
-/// horizontal midline so neither player has a positional advantage. We
-/// scatter terrain features in the TOP half only, then copy the result to
-/// the bottom half via vertical reflection. Map height must be even so the
-/// midline lies between rows.
+/// Generate a random map deterministically from `rng`, mirrored 180° across
+/// the map center so the two players land on opposite corners with identical
+/// terrain. Features are stamped only in a "canonical half" (top half plus
+/// the left half of the center row when height is odd); the rest is copied
+/// from there via point reflection.
 pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
     assert!(
-        height >= 2 && height % 2 == 0,
-        "mirrored maps require an even height >= 2"
+        width >= 4 && height >= 4,
+        "map dimensions must be at least 4 in each axis"
     );
-    let half = height / 2;
     let n = (width * height) as usize;
     let mut tiles = vec![Terrain::Plains; n];
     let idx = |x: i32, y: i32| -> Option<usize> {
@@ -287,20 +288,31 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
             Some((y * width + x) as usize)
         }
     };
+    let in_canonical_half = |x: i32, y: i32| -> bool {
+        if y < height / 2 {
+            return true;
+        }
+        // For odd heights the middle row generates from its left half.
+        if height % 2 == 1 && y == height / 2 && x < width / 2 {
+            return true;
+        }
+        false
+    };
     let stamp = |tiles: &mut [Terrain], pos: Coord, terrain: Terrain| {
-        if pos.1 < 0 || pos.1 >= half {
-            return; // top-half-only generation
+        if !in_canonical_half(pos.0, pos.1) {
+            return;
         }
         if let Some(i) = idx(pos.0, pos.1) {
             tiles[i] = terrain;
         }
     };
 
-    // Forest patches in the top half.
-    let n_forests = rng.gen_range(5..10);
+    // Density scales gently with map area so 8x8 maps don't get over-cluttered.
+    let area = width * height;
+    let n_forests = rng.gen_range((area / 30).max(2)..(area / 14).max(4));
     for _ in 0..n_forests {
         let cx = rng.gen_range(0..width);
-        let cy = rng.gen_range(0..half);
+        let cy = rng.gen_range(0..height);
         let size = rng.gen_range(3..8);
         for _ in 0..size {
             let ox = cx + rng.gen_range(-2..3);
@@ -309,27 +321,25 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
         }
     }
 
-    // Mountain ridges via biased random walk, top half.
-    let n_ridges = rng.gen_range(1..4);
+    let n_ridges = rng.gen_range(1..(area / 50).max(2) + 1);
     for _ in 0..n_ridges {
         let mut x = rng.gen_range(0..width);
-        let mut y = rng.gen_range(0..half);
-        let length = rng.gen_range(5..14);
+        let mut y = rng.gen_range(0..height);
+        let length = rng.gen_range(4..10);
         let bias_x: i32 = rng.gen_range(-1..2);
         let bias_y: i32 = rng.gen_range(-1..2);
         for _ in 0..length {
             stamp(&mut tiles, (x, y), Terrain::Mountain);
             x = (x + bias_x + rng.gen_range(-1..2)).clamp(0, width - 1);
-            y = (y + bias_y + rng.gen_range(-1..2)).clamp(0, half - 1);
+            y = (y + bias_y + rng.gen_range(-1..2)).clamp(0, height - 1);
         }
     }
 
-    // Small lakes, top half.
-    let n_lakes = rng.gen_range(0..3);
+    let n_lakes = rng.gen_range(0..(area / 60).max(1) + 1);
     for _ in 0..n_lakes {
         let cx = rng.gen_range(0..width);
-        let cy = rng.gen_range(0..half);
-        let size = rng.gen_range(3..7);
+        let cy = rng.gen_range(0..height);
+        let size = rng.gen_range(2..5);
         for _ in 0..size {
             let ox = cx + rng.gen_range(-2..3);
             let oy = cy + rng.gen_range(-2..3);
@@ -337,14 +347,20 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
         }
     }
 
-    // 180° rotation through the map center: (x, y) ↔ (width-1-x, height-1-y).
-    // Each top-half tile populates its bottom-half partner so the two players
-    // start on opposite corners with identical terrain.
-    for y in 0..half {
+    // 180° rotation through center: copy each canonical-half tile onto its
+    // partner. When width and height are both odd a single self-mapping
+    // tile (the exact center) is left as plains.
+    for y in 0..height {
         for x in 0..width {
-            let src = (y * width + x) as usize;
+            if !in_canonical_half(x, y) {
+                continue;
+            }
             let mx = width - 1 - x;
             let my = height - 1 - y;
+            if mx == x && my == y {
+                continue;
+            }
+            let src = (y * width + x) as usize;
             let dst = (my * width + mx) as usize;
             tiles[dst] = tiles[src];
         }
@@ -699,7 +715,11 @@ impl GameState {
 
     fn try_with_seed(seed: u64) -> Option<Self> {
         let mut rng = SmallRng::seed_from_u64(seed);
-        let map = random_map(DEFAULT_MAP_WIDTH, DEFAULT_MAP_HEIGHT, &mut rng);
+        // Map dimensions are part of the seed so the same number reproduces
+        // exactly the same battlefield (size + terrain + placements).
+        let width = rng.gen_range(MIN_MAP_DIM..=MAX_MAP_DIM);
+        let height = rng.gen_range(MIN_MAP_DIM..=MAX_MAP_DIM);
+        let map = random_map(width, height, &mut rng);
         let placements = random_placements(&map, &mut rng)?;
         if count_disjoint_paths(
             &map,
@@ -2087,6 +2107,28 @@ mod tests {
             .try_action(PlayerId::P1, atk, (1, 0), Some((2, 0)))
             .unwrap_err();
         assert!(err.contains("captured"), "got: {err}");
+    }
+
+    #[test]
+    fn random_dimensions_are_in_range() {
+        // Sample a generous slice of seeds and confirm whichever maps survive
+        // validation have width and height inside [MIN_MAP_DIM, MAX_MAP_DIM].
+        let mut tested = 0;
+        for seed in 0u64..200 {
+            let Ok(g) = GameState::with_seed(seed) else { continue };
+            assert!(
+                g.map.width >= MIN_MAP_DIM && g.map.width <= MAX_MAP_DIM,
+                "seed {seed}: width {} out of range",
+                g.map.width
+            );
+            assert!(
+                g.map.height >= MIN_MAP_DIM && g.map.height <= MAX_MAP_DIM,
+                "seed {seed}: height {} out of range",
+                g.map.height
+            );
+            tested += 1;
+        }
+        assert!(tested > 10, "very few seeds passed validation; tested={tested}");
     }
 
     #[test]

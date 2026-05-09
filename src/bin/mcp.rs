@@ -359,7 +359,7 @@ fn list_tools() -> Vec<Value> {
         }),
         json!({
             "name": "buy_unit",
-            "description": "Spend funds to spawn a unit at one of your factories. The factory must be yours, idle this turn, and have an empty tile (no unit standing on it). Newly produced units cannot act this turn. Costs: infantry=1000, scout=3000, heavy_infantry=2500.",
+            "description": "Spend funds to spawn a unit at one of your factories. Constraints: (1) factory.owner == you, (2) factory hasn't already produced this turn, (3) the factory tile is empty (no unit standing on it — move it off first), (4) you have enough funds. Newly bought units have has_moved=true and CANNOT act this turn. Costs: scout=1000g, infantry=2000g, heavy_infantry=3000g. Each factory can produce up to ONE unit per turn — separate from the per-unit movement allowance.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1065,24 +1065,41 @@ fn terrain_glyph(t: Terrain) -> char {
 fn format_state(view: &PlayerView, me: PlayerId) -> String {
     let mut s = String::new();
     s.push_str(
-        "Rules:\n\
-         • Win ONLY by destroying the enemy HQ (10 HP) or by their surrender. \
-           Losing all your units does NOT lose the game — rebuild at your factory or hold your HQ.\n\
-         • Each turn, every one of your units gets exactly ONE action (move, move+attack, or stay-and-attack). \
-           There is NO LIMIT on how many of your units you may act with per turn — act with all of them \
-           if you can. Each factory can produce up to ONE unit per turn (separate from unit actions).\n\
-         • Cities/factories are captured by ending your turn standing on them. Capture is INSTANT \
-           on end_turn (one round of standing). Capture flips ownership; the city pays its income \
-           on the NEXT turn cycle (250g/turn). HQs and factories pay 1000g/turn each.\n\
-         • Movement: each tile has a per-unit cost. Plains 1 always; Forest costs 1 for scouts \
-           but 2 for infantry/heavy; Mountain costs 2. A unit can enter AT MOST ONE mountain tile \
-           per turn (hard cap, even if move points remain).\n\
-         • Combat: damage = base × (atk_hp/10) × (1 − def_stars × def_hp_ratio × 0.1). Defenders \
-           counterattack with their post-hit HP if they survive and are in range. HQs do not counter. \
-           Cities/factories cannot be attacked — only captured.\n\
-         • Defense stars: terrain (plains 1, forest 2, mountain 4) + building bonus when occupying \
-           one (city/factory: infantry +3, others +2). Stars stack; cap at 90% damage reduction.\n\
-         • Surrender allowed from turn 4 onward.\n\n",
+        "RULES (read carefully — these are easy to misinfer from AW intuition):\n\n\
+         WIN: Only by destroying the enemy HQ (down to 0 HP, total 10 damage) or by their surrender. \
+         Wiping out every enemy unit does NOT win — they can rebuild at their factory and you have \
+         to crack the HQ. Surrender is allowed from turn 4 onward.\n\n\
+         TURN FLOW: Each of your units gets exactly ONE action per turn (move OR move+attack OR \
+         stay+attack). You may act with ALL of them in any order — there is NO per-turn limit on how \
+         many units you act with. After you've issued every action you want, call end_turn.\n\n\
+         MOVEMENT: Each unit has a fixed move-points budget — scout=7, infantry=3, heavy=2. Each \
+         tile you ENTER costs:\n  \
+         • plains   = 1\n  \
+         • forest   = 1 for scouts, 2 for infantry/heavy\n  \
+         • mountain = 2 (and a HARD CAP: a unit may enter AT MOST ONE mountain tile per turn, even \
+         if it has unspent move points)\n  \
+         • sea      = impassable\n\
+         Your starting tile is free. The total cost of entered tiles must not exceed your move \
+         points. Tiles occupied by other units, by friendly units you can't pass through (no \
+         pass-through of friendlies if you'd stop on them), or by HQs are not legal stops/passes.\n\n\
+         BUYING UNITS (at factories): scout=1000g, infantry=2000g, heavy_infantry=3000g. Each \
+         factory you own can produce ONCE per turn, and only if its tile is empty (move any unit \
+         off the factory first). New units have has_moved=true, so they CANNOT act the turn \
+         they're built. Production is independent of unit actions.\n\n\
+         CAPTURE: Move one of your infantry-class units onto a non-friendly city or factory, then \
+         call end_turn. Capture is INSTANT (one full turn standing). HQs are NOT captured — only \
+         destroyed by direct attack.\n\n\
+         COMBAT: damage = base × (atk_hp / 10) × (1 − def_stars × def_hp_ratio × 0.1). Defenders \
+         counterattack at post-hit HP if they survive and remain in range; HQs do not counter. \
+         Cities/factories cannot be attacked — only captured. See unit_stats for the damage matrix.\n\n\
+         DEFENSE STARS: terrain (plains 1, forest 2, mountain 4) plus a building bonus to whoever \
+         occupies it (city/factory infantry +3, scout/heavy +2; HQ to its occupant +4). Stars stack; \
+         the reduction caps at 90%.\n\n\
+         INCOME (paid at the start of your turn): HQ 1000g, factory 1000g, city 250g — for each \
+         that YOU own.\n\n\
+         RECOMMENDED LOOP: wait_for_turn → get_state → for each ready unit { legal_moves and/or \
+         attackable_targets → optional simulate_attack → act } → for each idle factory { buy_unit } \
+         → end_turn. Use unit_stats once if you need the damage matrix.\n\n",
     );
     s.push_str(&format!(
         "Map seed: {}. Turn {}; active player: {:?}; you are {:?}.\n",
@@ -1174,11 +1191,18 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
     mine.sort_by_key(|u| (u.pos.1, u.pos.0));
     theirs.sort_by_key(|u| (u.pos.1, u.pos.0));
 
-    s.push_str(&format!("\nYour units ({}):\n", mine.len()));
+    let ready = mine.iter().filter(|u| !u.has_moved).count();
+    let acted = mine.len() - ready;
+    s.push_str(&format!(
+        "\nYour units ({}, {} READY / {} acted):\n",
+        mine.len(),
+        ready,
+        acted
+    ));
     for u in &mine {
         let terrain = view.map.terrain(u.pos).map(terrain_name).unwrap_or("?");
         s.push_str(&format!(
-            "  {} {} hp={}/{} pos=[{},{}] on {} {}\n",
+            "  {} {} hp={}/{} pos=[{},{}] on {}  mv={} vis={}  [{}]\n",
             u.id,
             unit_kind_name(u.kind),
             u.hp,
@@ -1186,14 +1210,16 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
             u.pos.0,
             u.pos.1,
             terrain,
-            if u.has_moved { "(acted)" } else { "(can act)" },
+            u.kind.move_points(),
+            u.kind.vision(),
+            if u.has_moved { "ACTED" } else { "READY" },
         ));
     }
     s.push_str(&format!("\nVisible enemy units ({}):\n", theirs.len()));
     for u in &theirs {
         let terrain = view.map.terrain(u.pos).map(terrain_name).unwrap_or("?");
         s.push_str(&format!(
-            "  {} {} hp={}/{} pos=[{},{}] on {}\n",
+            "  {} {} hp={}/{} pos=[{},{}] on {}  mv={} vis={}\n",
             u.id,
             unit_kind_name(u.kind),
             u.hp,
@@ -1201,6 +1227,8 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
             u.pos.0,
             u.pos.1,
             terrain,
+            u.kind.move_points(),
+            u.kind.vision(),
         ));
     }
 

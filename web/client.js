@@ -270,8 +270,14 @@ function setStatus(text, cls = "") {
 function updateHud() {
   els.turnNumber.textContent = state.turnNumber;
   els.currentTurn.textContent = labelPlayer(state.currentTurn);
-  const myFunds = state.you ? (state.funds?.[state.you] ?? 0) : "—";
-  els.funds.textContent = myFunds === "—" ? "—" : `${myFunds}g`;
+  if (state.you) {
+    els.funds.textContent = `${state.funds?.[state.you] ?? 0}g`;
+  } else {
+    // Spectator sees both players' funds in real time.
+    const p1 = state.funds?.p1 ?? 0;
+    const p2 = state.funds?.p2 ?? 0;
+    els.funds.textContent = `P1 ${p1}g · P2 ${p2}g`;
+  }
   els.mapSeed.textContent = state.mapSeed ?? "–";
   if (state.winner) {
     const outcome = state.you === state.winner ? "you win!" : state.you ? "you lose." : "match over.";
