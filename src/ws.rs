@@ -148,6 +148,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 }
 
 async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<(), String> {
+    // Reset is allowed for anyone, including spectators.
+    if matches!(cmd, ClientMsg::Reset) {
+        let mut g = state.game.lock().await;
+        *g = GameState::new();
+        drop(g);
+        let _ = state.tx.send(());
+        return Ok(());
+    }
+
     let actor = match view {
         View::Spectator => return Err("spectators cannot act".into()),
         View::Player(p) => p,
@@ -155,8 +164,12 @@ async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<
     let mut g = state.game.lock().await;
     match cmd {
         ClientMsg::Join { .. } => Err("already joined".into()),
-        ClientMsg::Move { unit_id, to } => {
-            g.try_move(actor, unit_id, to)?;
+        ClientMsg::Move {
+            unit_id,
+            to,
+            attack,
+        } => {
+            g.try_action(actor, unit_id, to, attack)?;
             drop(g);
             let _ = state.tx.send(());
             Ok(())
@@ -167,5 +180,6 @@ async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<
             let _ = state.tx.send(());
             Ok(())
         }
+        ClientMsg::Reset => unreachable!("handled above"),
     }
 }

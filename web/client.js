@@ -1,8 +1,14 @@
 // agent-wars browser client
 //
-// Connects to ws://<host>/ws, sends a Join with the chosen view, then renders
-// every State it receives. For player views, fog-of-war tiles are drawn dim
-// and only visible-or-friendly units are rendered. Spectator sees everything.
+// Connects to ws://<host>/ws, picks a vantage, renders fog-filtered state.
+//
+// Click flow:
+//   1. Click a friendly infantry that hasn't acted -> highlight reachable tiles.
+//   2. Click a reachable tile -> if any adjacent enemies, enter "pick attack
+//      target"; otherwise send the move immediately.
+//   3. In attack mode, click an adjacent enemy to attack, or click the
+//      pending destination tile again to wait (move only). Click anywhere
+//      else to cancel.
 
 const TILE = 48;
 
@@ -18,6 +24,7 @@ const els = {
   role: document.getElementById("role"),
   connect: document.getElementById("connect"),
   endTurn: document.getElementById("endTurn"),
+  reset: document.getElementById("reset"),
   status: document.getElementById("status"),
   turnNumber: document.getElementById("turnNumber"),
   currentTurn: document.getElementById("currentTurn"),
@@ -27,10 +34,13 @@ const els = {
 const ctx = els.canvas.getContext("2d");
 
 let ws = null;
-let view = null;       // {type: "player", value: "p1"|"p2"} | "spectator"
-let state = null;      // last PlayerView received
-let selected = null;   // currently selected unit
-let reachable = null;  // Map<"x,y", true> for currently selected unit, computed locally
+let view = null;
+let state = null;       // last PlayerView received
+let selected = null;    // selected unit (object)
+let reachable = null;   // Set<"x,y"> while picking destination
+let pendingMove = null; // [x, y] of provisional destination
+let attackTargets = null; // Set<"x,y"> of enemy units we could attack from pendingMove
+let lastError = "";
 
 els.connect.addEventListener("click", () => {
   if (ws) ws.close();
@@ -40,8 +50,18 @@ els.connect.addEventListener("click", () => {
     : { type: "player", value: role === "player1" ? "p1" : "p2" };
   connect(view);
 });
-els.endTurn.addEventListener("click", () => {
-  send({ type: "endTurn" });
+els.endTurn.addEventListener("click", () => send({ type: "endTurn" }));
+els.reset.addEventListener("click", () => {
+  if (confirm("Reset the lobby? Everyone connected will see a fresh match.")) {
+    send({ type: "reset" });
+  }
+});
+
+els.canvas.addEventListener("contextmenu", (e) => {
+  // Right-click cancels current selection.
+  e.preventDefault();
+  clearSelection();
+  render();
 });
 
 els.canvas.addEventListener("click", (e) => {
@@ -52,18 +72,61 @@ els.canvas.addEventListener("click", (e) => {
   if (x < 0 || y < 0 || x >= state.map.width || y >= state.map.height) return;
 
   const me = state.you;
-  const isMyTurn = me && state.currentTurn === me;
+  const isMyTurn = me && state.currentTurn === me && !state.winner;
 
-  if (selected) {
-    if (reachable && reachable.has(`${x},${y}`)) {
-      send({ type: "move", unitId: selected.id, to: [x, y] });
+  // Phase 3: provisional destination chosen — pick attack target or wait.
+  if (pendingMove) {
+    const key = `${x},${y}`;
+    if (attackTargets && attackTargets.has(key)) {
+      send({ type: "move", unitId: selected.id, to: pendingMove, attack: [x, y] });
+      clearSelection(); render(); return;
     }
-    selected = null;
-    reachable = null;
-    render();
-    return;
+    if (pendingMove[0] === x && pendingMove[1] === y) {
+      send({ type: "move", unitId: selected.id, to: pendingMove });
+      clearSelection(); render(); return;
+    }
+    clearSelection(); render(); return;
   }
 
+  // Phase 2: a unit is selected.
+  if (selected) {
+    const clicked = unitAt(x, y);
+
+    // Click an enemy that we can attack from somewhere reachable: auto-resolve.
+    if (clicked && clicked.owner !== me) {
+      const standTile = findAttackPosition(selected, [x, y]);
+      if (standTile) {
+        send({ type: "move", unitId: selected.id, to: standTile, attack: [x, y] });
+        clearSelection(); render(); return;
+      }
+      // Out of range — fall through to cancel.
+    }
+
+    // Click a different friendly unit: switch selection.
+    if (clicked && clicked.owner === me && clicked.id !== selected.id && !clicked.hasMoved) {
+      selected = clicked;
+      reachable = computeReachable(clicked);
+      render(); return;
+    }
+
+    // Click a reachable empty tile: move (or enter attack-pick if enemies adjacent).
+    if (reachable && reachable.has(`${x},${y}`) && !clicked) {
+      const targets = enemiesAdjacentTo([x, y]);
+      if (targets.size > 0) {
+        pendingMove = [x, y];
+        attackTargets = targets;
+      } else {
+        send({ type: "move", unitId: selected.id, to: [x, y] });
+        clearSelection();
+      }
+      render(); return;
+    }
+
+    // Otherwise: clicked nothing useful — cancel selection.
+    clearSelection(); render(); return;
+  }
+
+  // Phase 1: nothing selected.
   if (!isMyTurn) return;
   const u = unitAt(x, y);
   if (u && u.owner === me && !u.hasMoved) {
@@ -72,6 +135,13 @@ els.canvas.addEventListener("click", (e) => {
   }
   render();
 });
+
+function clearSelection() {
+  selected = null;
+  reachable = null;
+  pendingMove = null;
+  attackTargets = null;
+}
 
 function connect(viewValue) {
   const url = `ws://${location.host}/ws`;
@@ -88,30 +158,31 @@ function connect(viewValue) {
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "state") {
       state = msg;
-      // If a previously selected unit no longer exists or has moved, clear selection.
+      // If our selected unit is gone or already acted, drop the selection.
       if (selected) {
         const fresh = state.units.find((u) => u.id === selected.id);
         if (!fresh || fresh.hasMoved) {
-          selected = null;
-          reachable = null;
+          clearSelection();
         } else {
           selected = fresh;
           reachable = computeReachable(fresh);
         }
       }
+      lastError = "";
       updateHud();
       render();
     } else if (msg.type === "joined") {
       // ack
     } else if (msg.type === "error") {
+      lastError = msg.message;
       console.warn("server error:", msg.message);
+      updateHud();
     }
   });
 }
 
 function serializeView(v) {
   if (v === "spectator") return "spectator";
-  // Player(p) is serialized as {"player": "p1"} by serde tagged enums.
   return { player: v.value };
 }
 
@@ -129,12 +200,15 @@ function updateHud() {
   els.turnNumber.textContent = state.turnNumber;
   els.currentTurn.textContent = labelPlayer(state.currentTurn);
   if (state.winner) {
-    els.winner.textContent = `${labelPlayer(state.winner)} wins`;
+    els.winner.textContent = `${labelPlayer(state.winner)} wins!`;
+  } else if (lastError) {
+    els.winner.textContent = `⚠ ${lastError}`;
   } else {
     els.winner.textContent = "";
   }
   const isMyTurn = state.you && state.currentTurn === state.you && !state.winner;
   els.endTurn.disabled = !isMyTurn;
+  els.reset.disabled = !ws || ws.readyState !== 1;
 }
 
 function labelPlayer(p) {
@@ -145,23 +219,66 @@ function unitAt(x, y) {
   return state.units.find((u) => u.pos[0] === x && u.pos[1] === y);
 }
 
-// Compute reachable tiles for a unit using the same rules as the server.
-// (Client-side only for the highlight; the server validates the actual move.)
+function enemiesAdjacentTo([x, y]) {
+  if (!state.you) return new Set();
+  const out = new Set();
+  for (const u of state.units) {
+    if (u.owner === state.you) continue;
+    const d = Math.abs(u.pos[0] - x) + Math.abs(u.pos[1] - y);
+    if (d >= 1 && d <= 1) out.add(`${u.pos[0]},${u.pos[1]}`);
+  }
+  return out;
+}
+
+// Find a reachable tile from which `unit` can attack `enemyPos` (melee Manhattan-1).
+// Prefers staying put if already adjacent; otherwise the cheapest reachable adjacent.
+function findAttackPosition(unit, enemyPos) {
+  const r = reachable || computeReachable(unit);
+  const cur = `${unit.pos[0]},${unit.pos[1]}`;
+  const adj = [
+    [enemyPos[0] + 1, enemyPos[1]],
+    [enemyPos[0] - 1, enemyPos[1]],
+    [enemyPos[0], enemyPos[1] + 1],
+    [enemyPos[0], enemyPos[1] - 1],
+  ];
+  if (adj.some(([ax, ay]) => `${ax},${ay}` === cur)) {
+    return [unit.pos[0], unit.pos[1]];
+  }
+  for (const [ax, ay] of adj) {
+    if (r.has(`${ax},${ay}`)) return [ax, ay];
+  }
+  return null;
+}
+
+// Enemies the selected unit could hit this turn from any reachable tile.
+function attackableEnemiesForSelected() {
+  if (!selected || !reachable) return new Set();
+  const out = new Set();
+  for (const u of state.units) {
+    if (u.owner === state.you) continue;
+    for (const k of reachable) {
+      const [rx, ry] = k.split(",").map(Number);
+      const d = Math.abs(rx - u.pos[0]) + Math.abs(ry - u.pos[1]);
+      if (d === 1) {
+        out.add(`${u.pos[0]},${u.pos[1]}`);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 function computeReachable(unit) {
   const map = state.map;
   const mp = 3; // infantry move points
-  const cost = {
-    plains: 1, forest: 1, mountain: 2, sea: null,
-  };
+  const cost = { plains: 1, forest: 1, mountain: 2, sea: null };
   const enemySet = new Set();
-  for (const u of state.units) {
-    if (u.owner !== unit.owner) enemySet.add(`${u.pos[0]},${u.pos[1]}`);
-  }
   const friendSet = new Set();
   for (const u of state.units) {
-    if (u.owner === unit.owner && u.id !== unit.id) friendSet.add(`${u.pos[0]},${u.pos[1]}`);
+    const k = `${u.pos[0]},${u.pos[1]}`;
+    if (u.owner !== unit.owner) enemySet.add(k);
+    else if (u.id !== unit.id) friendSet.add(k);
   }
-
   const best = new Map();
   best.set(`${unit.pos[0]},${unit.pos[1]}`, 0);
   const heap = [[0, unit.pos[0], unit.pos[1]]];
@@ -184,9 +301,7 @@ function computeReachable(unit) {
       }
     }
   }
-  // Can't stop on a tile occupied by friendly unit.
   for (const k of friendSet) best.delete(k);
-  // Can stay put.
   best.set(`${unit.pos[0]},${unit.pos[1]}`, 0);
   return new Set(best.keys());
 }
@@ -203,21 +318,20 @@ function render() {
 
   const visible = new Set(state.visibleTiles.map(([x, y]) => `${x},${y}`));
 
-  // Tiles
+  // Tiles + grid.
   for (let y = 0; y < map.height; y++) {
     for (let x = 0; x < map.width; x++) {
       const t = map.tiles[y * map.width + x];
       ctx.fillStyle = TERRAIN_COLORS[t] || "#222";
       ctx.fillRect(x * TILE, y * TILE, TILE, TILE);
-      // Grid line.
       ctx.strokeStyle = "#0006";
       ctx.lineWidth = 1;
       ctx.strokeRect(x * TILE + 0.5, y * TILE + 0.5, TILE - 1, TILE - 1);
     }
   }
 
-  // Reachable highlight under units.
-  if (reachable) {
+  // Reachable highlight (only when no pending move).
+  if (reachable && !pendingMove) {
     ctx.fillStyle = "rgba(255, 230, 120, 0.28)";
     for (const k of reachable) {
       const [x, y] = k.split(",").map(Number);
@@ -225,10 +339,34 @@ function render() {
     }
   }
 
-  // Units
-  for (const u of state.units) {
-    drawUnit(u, u.id === selected?.id);
+  // Pending move tile.
+  if (pendingMove) {
+    const [x, y] = pendingMove;
+    ctx.fillStyle = "rgba(255, 230, 120, 0.45)";
+    ctx.fillRect(x * TILE, y * TILE, TILE, TILE);
+    ctx.strokeStyle = "#ffd84a";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x * TILE + 1, y * TILE + 1, TILE - 2, TILE - 2);
   }
+
+  // Attack target rings: explicit attackTargets in attack-pick mode, OR
+  // pre-show all attackable enemies whenever a unit is selected.
+  const targetsToRing = attackTargets ?? attackableEnemiesForSelected();
+  if (targetsToRing.size > 0) {
+    ctx.strokeStyle = "#ff5050";
+    ctx.lineWidth = 3;
+    for (const k of targetsToRing) {
+      const [x, y] = k.split(",").map(Number);
+      const cx = x * TILE + TILE / 2;
+      const cy = y * TILE + TILE / 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, TILE * 0.42, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  // Units.
+  for (const u of state.units) drawUnit(u, u.id === selected?.id);
 
   // Fog overlay (player view only).
   if (state.you) {
@@ -257,15 +395,15 @@ function drawUnit(u, isSelected) {
   ctx.strokeStyle = u.hasMoved ? "#0008" : "#fff";
   ctx.stroke();
 
-  // HP badge if not full.
   if (u.hp < 10) {
+    const w = 16, h = 12;
     ctx.fillStyle = "#000a";
-    ctx.fillRect(cx + r - 8, cy + r - 10, 14, 12);
+    ctx.fillRect(cx + r - w * 0.5, cy + r - h * 0.4, w, h);
     ctx.fillStyle = "#fff";
     ctx.font = "bold 10px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(u.hp), cx + r - 1, cy + r - 4);
+    ctx.fillText(String(u.hp), cx + r, cy + r + 1);
   }
 
   if (isSelected) {
