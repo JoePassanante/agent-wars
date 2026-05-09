@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>agent-wars</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>agent-wars</h1>
+      <div class="controls">
+        <label>
+          View as
+          <select id="role">
+            <option value="player1">Player 1</option>
+            <option value="player2">Player 2</option>
+            <option value="spectator">Spectator</option>
+          </select>
+        </label>
+        <button id="connect">Connect</button>
+        <button id="endTurn" disabled>End turn</button>
+        <span id="status" class="status">disconnected</span>
+      </div>
+      <div class="hud">
+        <span>Turn <b id="turnNumber">–</b></span>
+        <span>Active: <b id="currentTurn">–</b></span>
+        <span id="winner" class="winner"></span>
+      </div>
+    </header>
+    <main>
+      <canvas id="board" width="600" height="500"></canvas>
+      <aside id="legend">
+        <h3>Legend</h3>
+        <ul>
+          <li><span class="swatch plains"></span> Plains (def 1)</li>
+          <li><span class="swatch forest"></span> Forest (def 2, hides)</li>
+          <li><span class="swatch mountain"></span> Mountain (def 4, +vis)</li>
+          <li><span class="swatch sea"></span> Sea (impassable)</li>
+        </ul>
+        <h3>Units</h3>
+        <ul>
+          <li><span class="swatch p1"></span> Player 1 infantry</li>
+          <li><span class="swatch p2"></span> Player 2 infantry</li>
+        </ul>
+        <p class="hint">
+          Click a friendly infantry to see reachable tiles, then click a
+          destination. End your turn when done.
+        </p>
+      </aside>
+    </main>
+    <script src="/client.js"></script>
+  </body>
+</html>

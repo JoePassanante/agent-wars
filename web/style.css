@@ -1,0 +1,78 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #1c1f24;
+  color: #e6e6e6;
+}
+header {
+  padding: 12px 18px;
+  background: #15171b;
+  border-bottom: 1px solid #2a2d33;
+}
+header h1 {
+  margin: 0 0 8px;
+  font-size: 18px;
+  letter-spacing: 0.5px;
+}
+.controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.controls label { display: flex; gap: 6px; align-items: center; }
+.controls select, .controls button {
+  background: #23262c;
+  color: #e6e6e6;
+  border: 1px solid #34383f;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font: inherit;
+}
+.controls button:not(:disabled):hover { background: #2c3038; }
+.controls button:disabled { opacity: 0.5; cursor: not-allowed; }
+.status { margin-left: auto; font-size: 13px; opacity: 0.8; }
+.status.connected { color: #6ad;}
+.status.error { color: #f66; }
+.hud { margin-top: 8px; display: flex; gap: 18px; font-size: 13px; opacity: 0.85; }
+.winner { color: #fc6; }
+
+main {
+  display: flex;
+  gap: 18px;
+  padding: 18px;
+  align-items: flex-start;
+}
+canvas {
+  background: #0d0f12;
+  border: 1px solid #2a2d33;
+  cursor: crosshair;
+  image-rendering: pixelated;
+}
+aside {
+  font-size: 13px;
+  background: #1f2228;
+  border: 1px solid #2a2d33;
+  padding: 12px 14px;
+  border-radius: 6px;
+  min-width: 220px;
+}
+aside h3 { margin: 0 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.7; }
+aside ul { list-style: none; padding: 0; margin: 0 0 12px; }
+aside li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+aside .hint { opacity: 0.65; line-height: 1.4; }
+
+.swatch {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid #000a;
+}
+.swatch.plains   { background: #4f7a3a; }
+.swatch.forest   { background: #2d4a23; }
+.swatch.mountain { background: #7a6b50; }
+.swatch.sea      { background: #1e4a78; }
+.swatch.p1       { background: #c34; border-radius: 50%; }
+.swatch.p2       { background: #38c; border-radius: 50%; }
