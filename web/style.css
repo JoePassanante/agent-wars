@@ -63,6 +63,58 @@ aside ul { list-style: none; padding: 0; margin: 0 0 12px; }
 aside li { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 aside .hint { opacity: 0.65; line-height: 1.4; }
 
+.lobby {
+  margin: 18px;
+  padding: 18px;
+  background: #1f2228;
+  border: 1px solid #2a2d33;
+  border-radius: 6px;
+  max-width: 720px;
+}
+.lobby h2 { margin: 0 0 12px; font-size: 18px; }
+.lobby h3 { margin: 18px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.7; }
+.lobby label { display: block; margin-bottom: 8px; font-size: 13px; }
+.lobby input {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 10px;
+  background: #15171b;
+  color: #e6e6e6;
+  border: 1px solid #34383f;
+  border-radius: 4px;
+  font: inherit;
+  width: 280px;
+}
+.lobby-actions { display: flex; gap: 8px; margin: 12px 0; }
+.lobby-actions button {
+  background: #23262c;
+  color: #e6e6e6;
+  border: 1px solid #34383f;
+  padding: 8px 14px;
+  border-radius: 4px;
+  font: inherit;
+  cursor: pointer;
+}
+.lobby-actions button:hover { background: #2c3038; }
+.lobby-status { font-size: 13px; opacity: 0.85; min-height: 1em; margin: 8px 0; }
+#sessionsTable { width: 100%; font-size: 12px; border-collapse: collapse; }
+#sessionsTable th, #sessionsTable td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #2a2d33; }
+#sessionsTable th { opacity: 0.6; font-weight: normal; }
+#sessionsTable tr.empty td { opacity: 0.5; font-style: italic; }
+#sessionsTable button {
+  background: #23262c; color: #e6e6e6; border: 1px solid #34383f;
+  padding: 2px 8px; border-radius: 3px; cursor: pointer; font: inherit;
+}
+#sessionsTable button:hover { background: #2c3038; }
+.role-tag {
+  font-size: 12px;
+  background: #23262c;
+  border: 1px solid #34383f;
+  padding: 2px 6px;
+  border-radius: 3px;
+  opacity: 0.85;
+}
+
 .swatch {
   display: inline-block;
   width: 14px;

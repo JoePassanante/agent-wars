@@ -16,6 +16,14 @@ pub const MAX_MAP_DIM: i32 = 15;
 /// single chokepoint that the better-positioned player can lock down.
 pub const MIN_DISJOINT_HQ_PATHS: usize = 3;
 
+/// Bumped whenever the random-map generator's output for a given seed
+/// could change (terrain density, placement rules, etc.). Recorded in
+/// replay logs so old replays know which generator made them.
+pub const MAP_GENERATOR_VERSION: u32 = 3;
+/// Bumped whenever rules or unit numbers change in a way that affects
+/// gameplay. Recorded in replay logs alongside the seed.
+pub const GAME_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Terrain {
@@ -1422,6 +1430,10 @@ pub struct PlayerView {
     /// Seed used to generate this map. Identical seeds reproduce identical
     /// maps so games can be replayed or shared.
     pub map_seed: u64,
+    /// Session this view belongs to. Set by the WS handler before sending;
+    /// the engine itself doesn't track sessions.
+    #[serde(default = "uuid::Uuid::nil")]
+    pub session_id: uuid::Uuid,
     #[serde(default)]
     pub last_action: Option<ActionReport>,
 }
@@ -1544,6 +1556,7 @@ impl GameState {
             funds,
             factories_used: self.factories_used.iter().copied().collect(),
             map_seed: self.map_seed,
+            session_id: uuid::Uuid::nil(),
             last_action: self.last_action.clone(),
         }
     }

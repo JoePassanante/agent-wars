@@ -24,11 +24,11 @@ const UNIT_KIND_LABELS = {
 
 const els = {
   role: document.getElementById("role"),
-  connect: document.getElementById("connect"),
   endTurn: document.getElementById("endTurn"),
   surrender: document.getElementById("surrender"),
-  reset: document.getElementById("reset"),
+  leave: document.getElementById("leave"),
   status: document.getElementById("status"),
+  sessionId: document.getElementById("sessionId"),
   turnNumber: document.getElementById("turnNumber"),
   currentTurn: document.getElementById("currentTurn"),
   funds: document.getElementById("funds"),
@@ -36,11 +36,20 @@ const els = {
   winner: document.getElementById("winner"),
   canvas: document.getElementById("board"),
   buyPanel: document.getElementById("buyPanel"),
+  // Lobby:
+  lobby: document.getElementById("lobby"),
+  boardArea: document.getElementById("board-area"),
+  usernameInput: document.getElementById("usernameInput"),
+  queueBtn: document.getElementById("queueBtn"),
+  browseBtn: document.getElementById("browseBtn"),
+  lobbyStatus: document.getElementById("lobbyStatus"),
+  sessionsBody: document.getElementById("sessionsBody"),
 };
 const ctx = els.canvas.getContext("2d");
 
 let ws = null;
-let view = null;
+let myView = null;       // "spectator" | { player: "p1"|"p2" }
+let mySessionId = null;
 let state = null;
 let selected = null;
 let reachable = null;
@@ -48,41 +57,111 @@ let pendingMove = null;
 let attackTargets = null;
 let lastError = "";
 
+// Restore last-used username so reconnect-by-username is one click.
+els.usernameInput.value = localStorage.getItem("agent-wars-username") || "";
+
 // Active move animation: { unitId, path: [[x,y],...], started: ms }
 let animation = null;
 
-els.connect.addEventListener("click", () => {
-  if (ws) ws.close();
-  const role = els.role.value;
-  view = role === "spectator"
-    ? "spectator"
-    : { type: "player", value: role === "player1" ? "p1" : "p2" };
-  connect(view);
+// ---------------- Lobby flow ----------------
+
+function lobbyStatus(text, cls = "") {
+  els.lobbyStatus.textContent = text;
+  els.lobbyStatus.className = "lobby-status " + cls;
+}
+
+async function refreshSessions() {
+  try {
+    const resp = await fetch("/api/sessions");
+    const sessions = await resp.json();
+    if (!sessions.length) {
+      els.sessionsBody.innerHTML = '<tr class="empty"><td colspan="6">No active sessions yet.</td></tr>';
+      return;
+    }
+    els.sessionsBody.innerHTML = sessions.map((s) => `
+      <tr>
+        <td><code>${shortId(s.id)}</code></td>
+        <td>${s.mapWidth}×${s.mapHeight}</td>
+        <td>${s.turnNumber}</td>
+        <td>${s.currentTurn}${s.hasWinner ? " ✓" : ""}</td>
+        <td>${s.p1Units}/${s.p2Units}</td>
+        <td><button data-watch="${s.id}">Watch</button></td>
+      </tr>`).join("");
+    els.sessionsBody.querySelectorAll("button[data-watch]").forEach((b) => {
+      b.addEventListener("click", () => {
+        const username = currentUsername();
+        if (!username) return;
+        watchSession(b.dataset.watch, username);
+      });
+    });
+  } catch (e) {
+    els.sessionsBody.innerHTML = `<tr class="empty"><td colspan="6">Failed to load sessions: ${e}</td></tr>`;
+  }
+}
+
+function shortId(id) { return id.slice(0, 8); }
+
+function currentUsername() {
+  const u = (els.usernameInput.value || "").trim();
+  if (!/^[A-Za-z0-9_-]{1,32}$/.test(u)) {
+    lobbyStatus("Username must be 1–32 chars, letters/numbers/_/-", "error");
+    return null;
+  }
+  localStorage.setItem("agent-wars-username", u);
+  return u;
+}
+
+els.queueBtn.addEventListener("click", () => {
+  const username = currentUsername();
+  if (!username) return;
+  connect(username, { kind: "play" });
 });
+
+els.browseBtn.addEventListener("click", () => {
+  refreshSessions();
+});
+
 els.endTurn.addEventListener("click", () => send({ type: "endTurn" }));
 els.surrender.addEventListener("click", () => {
   if (confirm("Surrender? The other player will win immediately.")) {
     send({ type: "surrender" });
   }
 });
-els.reset.addEventListener("click", () => {
-  const input = prompt(
-    "Reset the lobby. Leave blank for a random map, or enter a seed (u64) to reproduce a specific map.",
-    "",
-  );
-  if (input === null) return;
-  const trimmed = input.trim();
-  if (trimmed === "") {
-    send({ type: "reset" });
-  } else {
-    const seed = Number(trimmed);
-    if (!Number.isFinite(seed) || seed < 0) {
-      alert("Seed must be a non-negative integer.");
-      return;
-    }
-    send({ type: "reset", seed });
-  }
+els.leave.addEventListener("click", () => {
+  if (!confirm("Leave the session? Player connections will get auto-reconnected on next Hello.")) return;
+  send({ type: "leave" });
+  if (ws) ws.close();
+  showLobby();
+  refreshSessions();
 });
+
+function watchSession(sessionId, username) {
+  connect(username, { kind: "watch", sessionId });
+}
+
+function showLobby() {
+  els.lobby.style.display = "";
+  els.boardArea.hidden = true;
+  state = null;
+  myView = null;
+  mySessionId = null;
+  setStatus("disconnected");
+  els.endTurn.disabled = true;
+  els.surrender.disabled = true;
+  els.leave.disabled = true;
+  els.role.textContent = "";
+}
+
+function showGame() {
+  els.lobby.style.display = "none";
+  els.boardArea.hidden = false;
+}
+
+// Periodically refresh the session list while in lobby.
+setInterval(() => {
+  if (els.lobby.style.display !== "none" && !ws) refreshSessions();
+}, 3000);
+refreshSessions();
 
 els.canvas.addEventListener("contextmenu", (e) => {
   e.preventDefault();
@@ -175,27 +254,60 @@ function clearSelection() {
   attackTargets = null;
 }
 
-function connect(viewValue) {
+function connect(username, intent) {
   const url = `ws://${location.host}/ws`;
   setStatus("connecting…");
+  lobbyStatus("Connecting…");
   ws = new WebSocket(url);
   ws.addEventListener("open", () => {
     setStatus("connected", "connected");
-    send({ type: "join", view: serializeView(viewValue) });
+    ws.send(JSON.stringify({ type: "hello", username, intent }));
   });
-  ws.addEventListener("close", () => setStatus("disconnected"));
+  ws.addEventListener("close", () => {
+    setStatus("disconnected");
+    if (!state) {
+      // We never made it into a session — hop back to the lobby.
+      showLobby();
+    }
+  });
   ws.addEventListener("error", () => setStatus("error", "error"));
   ws.addEventListener("message", (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "state") {
-      handleState(msg);
-    } else if (msg.type === "joined") {
-      // ack
-    } else if (msg.type === "error") {
-      lastError = msg.message;
-      console.warn("server error:", msg.message);
-      updateHud();
+    switch (msg.type) {
+      case "hello":
+        lobbyStatus(`connected to server v${msg.serverVersion}`);
+        break;
+      case "queued":
+        lobbyStatus(`Queued — position ${msg.position}. Waiting for an opponent…`);
+        break;
+      case "matched":
+        myView = { player: msg.role };
+        mySessionId = msg.sessionId;
+        lobbyStatus(`Matched as ${msg.role}!`);
+        showGame();
+        break;
+      case "reconnected":
+        myView = { player: msg.role };
+        mySessionId = msg.sessionId;
+        lobbyStatus(`Reconnected as ${msg.role}.`);
+        showGame();
+        break;
+      case "spectating":
+        myView = "spectator";
+        mySessionId = msg.sessionId;
+        lobbyStatus(`Spectating ${shortId(msg.sessionId)}.`);
+        showGame();
+        break;
+      case "state":
+        handleState(msg);
+        break;
+      case "error":
+        lastError = msg.message;
+        console.warn("server error:", msg.message);
+        if (!state) lobbyStatus(`Error: ${msg.message}`, "error");
+        updateHud();
+        break;
     }
   });
 }
@@ -252,11 +364,6 @@ function animatedPosition() {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
-function serializeView(v) {
-  if (v === "spectator") return "spectator";
-  return { player: v.value };
-}
-
 function send(msg) {
   if (!ws || ws.readyState !== 1) return;
   ws.send(JSON.stringify(msg));
@@ -279,6 +386,10 @@ function updateHud() {
     els.funds.textContent = `P1 ${p1}g · P2 ${p2}g`;
   }
   els.mapSeed.textContent = state.mapSeed ?? "–";
+  els.sessionId.textContent = state.sessionId ? state.sessionId.slice(0, 8) : "–";
+  els.role.textContent = state.you
+    ? labelPlayer(state.you)
+    : "Spectator";
   if (state.winner) {
     const outcome = state.you === state.winner ? "you win!" : state.you ? "you lose." : "match over.";
     els.winner.textContent = `${labelPlayer(state.winner)} wins — ${outcome}`;
@@ -290,7 +401,7 @@ function updateHud() {
   const isMyTurn = state.you && state.currentTurn === state.you && !state.winner;
   els.endTurn.disabled = !isMyTurn;
   els.surrender.disabled = !state.you || state.winner || state.turnNumber < 4;
-  els.reset.disabled = !ws || ws.readyState !== 1;
+  els.leave.disabled = !ws || ws.readyState !== 1;
   renderBuyPanel(isMyTurn);
 }
 

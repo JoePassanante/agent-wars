@@ -8,30 +8,51 @@
   <body>
     <header>
       <h1>agent-wars</h1>
-      <div class="controls">
-        <label>
-          View as
-          <select id="role">
-            <option value="player1">Player 1</option>
-            <option value="player2">Player 2</option>
-            <option value="spectator">Spectator</option>
-          </select>
-        </label>
-        <button id="connect">Connect</button>
-        <button id="endTurn" disabled>End turn</button>
-        <button id="surrender" disabled title="Allowed from turn 4">Surrender</button>
-        <button id="reset" disabled>Reset lobby</button>
-        <span id="status" class="status">disconnected</span>
-      </div>
       <div class="hud">
+        <span>Session <b id="sessionId">–</b></span>
+        <span>Seed <b id="mapSeed">–</b></span>
         <span>Turn <b id="turnNumber">–</b></span>
-        <span>Active: <b id="currentTurn">–</b></span>
-        <span>Funds: <b id="funds">–</b></span>
-        <span>Seed: <b id="mapSeed">–</b></span>
+        <span>Active <b id="currentTurn">–</b></span>
+        <span>Funds <b id="funds">–</b></span>
         <span id="winner" class="winner"></span>
       </div>
+      <div class="controls">
+        <span id="status" class="status">disconnected</span>
+        <span id="role" class="role-tag"></span>
+        <button id="endTurn" disabled>End turn</button>
+        <button id="surrender" disabled title="Allowed from turn 4">Surrender</button>
+        <button id="leave" disabled>Leave</button>
+      </div>
     </header>
-    <main>
+
+    <!-- Lobby panel: only visible until matched/spectating. -->
+    <div id="lobby" class="lobby">
+      <h2>Join the lobby</h2>
+      <label>
+        Username
+        <input id="usernameInput" placeholder="alphanumeric_-" maxlength="32" autocomplete="off" />
+      </label>
+      <div class="lobby-actions">
+        <button id="queueBtn">Queue as player</button>
+        <button id="browseBtn">Watch a game</button>
+      </div>
+      <p id="lobbyStatus" class="lobby-status"></p>
+      <h3>Active sessions</h3>
+      <table id="sessionsTable">
+        <thead>
+          <tr><th>id</th><th>size</th><th>turn</th><th>active</th><th>units P1/P2</th><th></th></tr>
+        </thead>
+        <tbody id="sessionsBody">
+          <tr><td colspan="6" class="empty">Loading…</td></tr>
+        </tbody>
+      </table>
+      <p class="hint">
+        Pick a username and Queue → you'll be matched once another player
+        joins. Or click Watch on any active session below to spectate.
+      </p>
+    </div>
+
+    <main id="board-area" hidden>
       <canvas id="board" width="600" height="500"></canvas>
       <aside id="sidebar">
         <h3>Buy at factory</h3>
@@ -50,7 +71,7 @@
         <ul>
           <li><span class="bldg hq"></span> HQ — destroyed at 0 HP, owner loses</li>
           <li><span class="bldg factory"></span> Factory — buys 1 unit/turn</li>
-          <li><span class="bldg city"></span> City — captured, +1000g/turn</li>
+          <li><span class="bldg city"></span> City — captured, +250g/turn</li>
         </ul>
         <h3>Units</h3>
         <ul>

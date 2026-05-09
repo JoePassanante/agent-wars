@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_wars::game::{Coord, GameState, PlayerId, PlayerView, Terrain, Unit, UnitKind, View};
-use agent_wars::proto::{ClientMsg, ServerMsg};
+use agent_wars::game::{Coord, GameState, PlayerId, PlayerView, Terrain, Unit, UnitKind};
+use agent_wars::proto::{ClientIntent, ClientMsg, ServerMsg};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -23,35 +23,42 @@ use uuid::Uuid;
 #[derive(Parser, Debug)]
 #[command(name = "agent-wars-mcp", about = "MCP server for agent-wars")]
 struct Args {
-    /// Which player this agent controls (p1 or p2).
-    #[arg(long, value_parser = parse_player)]
-    player: PlayerId,
+    /// Username this agent uses to queue / reconnect. Required.
+    /// Aliased as --player for backward compat with old configs.
+    #[arg(long, alias = "player")]
+    username: String,
     /// agent-wars WebSocket URL.
     #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
     url: String,
 }
 
-fn parse_player(s: &str) -> Result<PlayerId, String> {
-    match s.to_lowercase().as_str() {
-        "p1" | "player1" | "1" => Ok(PlayerId::P1),
-        "p2" | "player2" | "2" => Ok(PlayerId::P2),
-        _ => Err(format!("expected p1 or p2, got '{s}'")),
-    }
-}
-
 struct McpClient {
-    player: PlayerId,
+    /// Set once when the server confirms a Matched / Reconnected attachment.
+    /// `OnceLock` so reads are sync and the value can't be reassigned.
+    player: std::sync::OnceLock<PlayerId>,
+    session_id: std::sync::OnceLock<uuid::Uuid>,
+    #[allow(dead_code)]
+    username: String,
     state: Mutex<Option<PlayerView>>,
     cmd_tx: mpsc::Sender<ClientMsg>,
     events: broadcast::Sender<ServerMsg>,
+}
+
+impl McpClient {
+    fn player(&self) -> PlayerId {
+        *self
+            .player
+            .get()
+            .expect("MCP tools shouldn't run before matchmaking completes")
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     eprintln!(
-        "agent-wars MCP starting as {:?}, connecting to {}",
-        args.player, args.url
+        "agent-wars MCP starting as username={}, connecting to {}",
+        args.username, args.url
     );
 
     let (ws_stream, _) = connect_async(&args.url).await?;
@@ -61,7 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (events_tx, _) = broadcast::channel::<ServerMsg>(64);
 
     let client = Arc::new(McpClient {
-        player: args.player,
+        player: std::sync::OnceLock::new(),
+        session_id: std::sync::OnceLock::new(),
+        username: args.username.clone(),
         state: Mutex::new(None),
         cmd_tx: cmd_tx.clone(),
         events: events_tx.clone(),
@@ -105,28 +114,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Subscribe before joining so we don't miss the initial State push.
+    // Subscribe before saying Hello so we don't miss the bootstrap messages.
     let mut bootstrap = client.events.subscribe();
     cmd_tx
-        .send(ClientMsg::Join {
-            view: View::Player(args.player),
+        .send(ClientMsg::Hello {
+            username: args.username.clone(),
+            intent: ClientIntent::Play,
         })
         .await?;
 
-    // Wait for the initial state (or fail fast).
+    // Walk the bootstrap state machine: Hello → Queued/Reconnected → Matched
+    // → State. Note Queued can sit for a while (until another player joins),
+    // so we don't bail on Queued; we wait without a deadline once it lands.
     let mut got_state = false;
+    let mut hard_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !got_state {
-        match timeout(Duration::from_secs(5), bootstrap.recv()).await {
-            Ok(Ok(ServerMsg::State(_))) => got_state = true,
-            Ok(Ok(ServerMsg::Joined { .. })) => {}
-            Ok(Ok(ServerMsg::Error { message })) => {
-                eprintln!("server error during join: {message}");
+        // Loose 10s budget for the pre-queue phase. Once Queued lands the
+        // deadline gets refreshed each tick to "no timeout".
+        let now = tokio::time::Instant::now();
+        let remaining = if now >= hard_deadline {
+            Duration::from_secs(0)
+        } else {
+            hard_deadline - now
+        };
+        match timeout(remaining, bootstrap.recv()).await {
+            Ok(Ok(ServerMsg::Hello { server_version, .. })) => {
+                eprintln!("connected to server v{server_version}");
             }
-            _ => break,
+            Ok(Ok(ServerMsg::Queued { position })) => {
+                eprintln!("queued at position {position}; waiting for opponent…");
+                hard_deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+            }
+            Ok(Ok(ServerMsg::Matched { session_id, role })) => {
+                eprintln!("matched into session {session_id} as {role:?}");
+                let _ = client.player.set(role);
+                let _ = client.session_id.set(session_id);
+                hard_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            }
+            Ok(Ok(ServerMsg::Reconnected { session_id, role })) => {
+                eprintln!("reconnected to session {session_id} as {role:?}");
+                let _ = client.player.set(role);
+                let _ = client.session_id.set(session_id);
+            }
+            Ok(Ok(ServerMsg::Spectating { session_id })) => {
+                eprintln!("spectating session {session_id} (MCP runs as player only — exiting)");
+                return Err("MCP only supports playing, not spectating".into());
+            }
+            Ok(Ok(ServerMsg::State(_))) => got_state = true,
+            Ok(Ok(ServerMsg::Error { message })) => {
+                eprintln!("server error: {message}");
+                return Err(format!("server error: {message}").into());
+            }
+            Ok(Err(_)) => return Err("event channel closed during handshake".into()),
+            Err(_) => return Err("timed out waiting for matchmaking".into()),
         }
-    }
-    if !got_state {
-        return Err("never received initial state".into());
     }
 
     eprintln!("agent-wars MCP ready");
@@ -394,18 +435,9 @@ fn list_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
-            "name": "reset_lobby",
-            "description": "Reset the entire match to a fresh start. By default a new random map is generated. Pass `seed` (u64) to reproduce a specific map; the seed is rejected if it doesn't yield a map with at least 3 disjoint HQ paths. The current map's seed is reported in get_state and at the top of every action response.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "seed": {
-                        "type": "integer",
-                        "description": "Optional u64 seed for deterministic map generation. Omit for a fresh random map."
-                    }
-                },
-                "required": []
-            }
+            "name": "list_sessions",
+            "description": "List currently active sessions (lobby browser). Returns each session's id, map size, turn number, active player, and unit counts. Useful for understanding the lobby state but not normally needed for play — your assigned session was given to you in the matchmaking response.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
     ]
 }
@@ -423,12 +455,76 @@ async fn dispatch_tool(
         "buy_unit" => handle_buy_unit(client, args).await,
         "unit_stats" => Ok(format_unit_stats()),
         "simulate_attack" => handle_simulate_attack(client, args).await,
+        "list_sessions" => handle_list_sessions().await,
         "end_turn" => handle_end_turn(client).await,
         "wait_for_turn" => handle_wait_for_turn(client, args).await,
         "surrender" => handle_surrender(client).await,
-        "reset_lobby" => handle_reset(client, args).await,
         other => Err(format!("unknown tool: {other}")),
     }
+}
+
+async fn handle_list_sessions() -> Result<String, String> {
+    // Fetch the lobby's active sessions from the HTTP endpoint. Cheap; this
+    // is a stateless GET so we don't keep a long-running HTTP client.
+    let url = "http://127.0.0.1:8080/api/sessions";
+    let body = match tokio_tungstenite_fetch_text(url).await {
+        Ok(b) => b,
+        Err(e) => return Err(format!("failed to fetch session list: {e}")),
+    };
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&body).map_err(|e| format!("bad session list: {e}"))?;
+    if sessions.is_empty() {
+        return Ok("No active sessions.\n".into());
+    }
+    let mut s = String::from("Active sessions:\n");
+    for sess in &sessions {
+        s.push_str(&format!(
+            "  {} — {}x{} map, turn {}, {:?}'s turn{}{}\n",
+            sess["id"],
+            sess["mapWidth"],
+            sess["mapHeight"],
+            sess["turnNumber"],
+            sess["currentTurn"],
+            if sess["hasWinner"].as_bool().unwrap_or(false) {
+                " [GAME OVER]"
+            } else {
+                ""
+            },
+            if let (Some(p1), Some(p2)) = (sess["p1Units"].as_u64(), sess["p2Units"].as_u64()) {
+                format!(" — units P1:{p1} P2:{p2}")
+            } else {
+                String::new()
+            },
+        ));
+    }
+    Ok(s)
+}
+
+/// Tiny HTTP GET helper using a raw TCP connection so we don't pull in
+/// `reqwest`. Suitable for local same-machine fetches only.
+async fn tokio_tungstenite_fetch_text(url: &str) -> std::io::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let parsed = url
+        .strip_prefix("http://")
+        .ok_or_else(|| std::io::Error::other("only http:// supported"))?;
+    let (host_port, path) = match parsed.find('/') {
+        Some(i) => (&parsed[..i], &parsed[i..]),
+        None => (parsed, "/"),
+    };
+    let mut stream = TcpStream::connect(host_port).await?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await?;
+    let mut buf = String::new();
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).await?;
+    let raw = String::from_utf8_lossy(&bytes).to_string();
+    if let Some(idx) = raw.find("\r\n\r\n") {
+        buf.push_str(&raw[idx + 4..]);
+    } else {
+        buf.push_str(&raw);
+    }
+    Ok(buf)
 }
 
 async fn handle_get_state(client: &Arc<McpClient>) -> Result<String, String> {
@@ -438,7 +534,7 @@ async fn handle_get_state(client: &Arc<McpClient>) -> Result<String, String> {
         .await
         .clone()
         .ok_or("no state yet")?;
-    Ok(format_state(&view, client.player))
+    Ok(format_state(&view, client.player()))
 }
 
 async fn handle_legal_moves(client: &Arc<McpClient>, args: &Value) -> Result<String, String> {
@@ -449,7 +545,7 @@ async fn handle_legal_moves(client: &Arc<McpClient>, args: &Value) -> Result<Str
         .units
         .get(&unit_id)
         .ok_or_else(|| format!("unit {unit_id} not visible"))?;
-    if unit.owner != client.player {
+    if unit.owner != client.player() {
         return Err("not your unit".into());
     }
     let reachable = synth.reachable(unit_id);
@@ -477,7 +573,7 @@ async fn handle_attackable(client: &Arc<McpClient>, args: &Value) -> Result<Stri
         .get(&unit_id)
         .ok_or_else(|| format!("unit {unit_id} not visible"))?
         .clone();
-    if unit.owner != client.player {
+    if unit.owner != client.player() {
         return Err("not your unit".into());
     }
     let (min_r, max_r) = unit.kind.attack_range();
@@ -589,7 +685,7 @@ async fn handle_act(client: &Arc<McpClient>, args: &Value) -> Result<String, Str
             unit_id,
             to,
             target,
-            client.player,
+            client.player(),
         )),
         _ => Err("unexpected server response".into()),
     }
@@ -657,7 +753,7 @@ async fn handle_simulate_attack(
         .get(&unit_id)
         .ok_or_else(|| format!("unit {unit_id} not visible"))?
         .clone();
-    if attacker.owner != client.player {
+    if attacker.owner != client.player() {
         return Err("not your unit".into());
     }
     let from = match args.get("from") {
@@ -728,7 +824,7 @@ async fn handle_simulate_attack(
         Ok(s)
     } else if let Some(rb) = view.buildings.iter().find(|rb| rb.building.pos == target_pos) {
         use agent_wars::game::BuildingKind;
-        if rb.building.owner == Some(client.player) {
+        if rb.building.owner == Some(client.player()) {
             return Err("target is your own building".into());
         }
         if !matches!(rb.building.kind, BuildingKind::Hq) {
@@ -782,7 +878,7 @@ async fn handle_buy_unit(client: &Arc<McpClient>, args: &Value) -> Result<String
         .lock()
         .await
         .as_ref()
-        .and_then(|v| v.funds.get(&client.player).copied())
+        .and_then(|v| v.funds.get(&client.player()).copied())
         .unwrap_or(0);
 
     let mut events = client.events.subscribe();
@@ -794,7 +890,7 @@ async fn handle_buy_unit(client: &Arc<McpClient>, args: &Value) -> Result<String
     match wait_for_response(&mut events).await? {
         ServerMsg::Error { message } => Err(message),
         ServerMsg::State(new) => {
-            let new_funds = new.funds.get(&client.player).copied().unwrap_or(0);
+            let new_funds = new.funds.get(&client.player()).copied().unwrap_or(0);
             let spent = prev_funds.saturating_sub(new_funds);
             Ok(format!(
                 "Bought {} for {}g. Funds remaining: {}g.\n",
@@ -812,7 +908,7 @@ async fn handle_end_turn(client: &Arc<McpClient>) -> Result<String, String> {
     // can call out captures and the income tick to the agent explicitly —
     // diffing state in their head is where the hallucinations come from.
     let prev = client.state.lock().await.clone();
-    let me = client.player;
+    let me = client.player();
 
     let mut events = client.events.subscribe();
     client
@@ -891,7 +987,7 @@ async fn handle_wait_for_turn(
         .and_then(|v| v.as_u64())
         .unwrap_or(50)
         .clamp(1, 120);
-    let me = client.player;
+    let me = client.player();
 
     // Subscribe BEFORE the first state read so we never miss a transition.
     let mut events = client.events.subscribe();
@@ -964,25 +1060,7 @@ async fn handle_surrender(client: &Arc<McpClient>) -> Result<String, String> {
         ServerMsg::Error { message } => Err(message),
         ServerMsg::State(new) => Ok(format!(
             "Surrendered. Winner: {:?}.\n",
-            new.winner.unwrap_or(client.player.other())
-        )),
-        _ => Err("unexpected server response".into()),
-    }
-}
-
-async fn handle_reset(client: &Arc<McpClient>, args: &Value) -> Result<String, String> {
-    let seed = args.get("seed").and_then(|v| v.as_u64());
-    let mut events = client.events.subscribe();
-    client
-        .cmd_tx
-        .send(ClientMsg::Reset { seed })
-        .await
-        .map_err(|_| "writer task dead".to_string())?;
-    match wait_for_response(&mut events).await? {
-        ServerMsg::Error { message } => Err(message),
-        ServerMsg::State(view) => Ok(format!(
-            "Lobby reset to fresh state. Map seed: {}.\n",
-            view.map_seed
+            new.winner.unwrap_or(client.player().other())
         )),
         _ => Err("unexpected server response".into()),
     }
@@ -993,7 +1071,13 @@ async fn wait_for_response(
 ) -> Result<ServerMsg, String> {
     loop {
         match timeout(Duration::from_secs(5), events.recv()).await {
-            Ok(Ok(ServerMsg::Joined { .. })) => continue,
+            // Lobby/handshake messages can re-arrive on long-running sessions
+            // (e.g., reconnection acks); they aren't responses to commands.
+            Ok(Ok(ServerMsg::Hello { .. }))
+            | Ok(Ok(ServerMsg::Queued { .. }))
+            | Ok(Ok(ServerMsg::Matched { .. }))
+            | Ok(Ok(ServerMsg::Reconnected { .. }))
+            | Ok(Ok(ServerMsg::Spectating { .. })) => continue,
             Ok(Ok(other)) => return Ok(other),
             Ok(Err(_)) => return Err("event channel closed".into()),
             Err(_) => return Err("timed out waiting for server response".into()),
