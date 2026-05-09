@@ -32,6 +32,7 @@ const els = {
   turnNumber: document.getElementById("turnNumber"),
   currentTurn: document.getElementById("currentTurn"),
   funds: document.getElementById("funds"),
+  mapSeed: document.getElementById("mapSeed"),
   winner: document.getElementById("winner"),
   canvas: document.getElementById("board"),
   buyPanel: document.getElementById("buyPanel"),
@@ -65,8 +66,21 @@ els.surrender.addEventListener("click", () => {
   }
 });
 els.reset.addEventListener("click", () => {
-  if (confirm("Reset the lobby? Everyone connected will see a fresh match.")) {
+  const input = prompt(
+    "Reset the lobby. Leave blank for a random map, or enter a seed (u64) to reproduce a specific map.",
+    "",
+  );
+  if (input === null) return;
+  const trimmed = input.trim();
+  if (trimmed === "") {
     send({ type: "reset" });
+  } else {
+    const seed = Number(trimmed);
+    if (!Number.isFinite(seed) || seed < 0) {
+      alert("Seed must be a non-negative integer.");
+      return;
+    }
+    send({ type: "reset", seed });
   }
 });
 
@@ -258,6 +272,7 @@ function updateHud() {
   els.currentTurn.textContent = labelPlayer(state.currentTurn);
   const myFunds = state.you ? (state.funds?.[state.you] ?? 0) : "—";
   els.funds.textContent = myFunds === "—" ? "—" : `${myFunds}g`;
+  els.mapSeed.textContent = state.mapSeed ?? "–";
   if (state.winner) {
     const outcome = state.you === state.winner ? "you win!" : state.you ? "you lose." : "match over.";
     els.winner.textContent = `${labelPlayer(state.winner)} wins — ${outcome}`;

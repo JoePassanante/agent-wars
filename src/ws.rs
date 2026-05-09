@@ -149,9 +149,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
 async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<(), String> {
     // Reset is allowed for anyone, including spectators.
-    if matches!(cmd, ClientMsg::Reset) {
+    if let ClientMsg::Reset { seed } = cmd {
+        let new_state = match seed {
+            None => GameState::new(),
+            Some(s) => GameState::with_seed(s)?,
+        };
         let mut g = state.game.lock().await;
-        *g = GameState::new();
+        *g = new_state;
         drop(g);
         let _ = state.tx.send(());
         return Ok(());
@@ -192,6 +196,6 @@ async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<
             let _ = state.tx.send(());
             Ok(())
         }
-        ClientMsg::Reset => unreachable!("handled above"),
+        ClientMsg::Reset { .. } => unreachable!("handled above"),
     }
 }

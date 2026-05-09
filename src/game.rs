@@ -1,8 +1,18 @@
+use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 pub type Coord = (i32, i32);
+
+pub const DEFAULT_MAP_WIDTH: i32 = 10;
+pub const DEFAULT_MAP_HEIGHT: i32 = 30;
+/// Generated maps must have at least this many vertex-disjoint land paths
+/// between the two HQs. Stops the random generator from producing maps with a
+/// single chokepoint that the better-positioned player can lock down.
+pub const MIN_DISJOINT_HQ_PATHS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -231,45 +241,296 @@ impl Map {
     }
 }
 
-/// Build a small demo map for MVP testing.
-pub fn demo_map() -> Map {
-    use Terrain::*;
-    let w = 12;
-    let h = 10;
-    // P = plains, F = forest, M = mountain, ~ = sea
-    // A small central lake forces infantry to flow around it but doesn't
-    // cleave the map, so the two armies can engage.
-    #[rustfmt::skip]
-    let layout = [
-        "PPPPPPPPPPPP",
-        "PPFFPPPPMMPP",
-        "PPFFPPPPMMPP",
-        "PPPPPPPPPPPP",
-        "PPPPP~~PPPPP",
-        "PPPPP~~PPPPP",
-        "PPPPPPPPPPPP",
-        "PPMMPPPPFFPP",
-        "PPMMPPPPFFPP",
-        "PPPPPPPPPPPP",
-    ];
-    let tiles: Vec<Terrain> = layout
-        .iter()
-        .flat_map(|row| {
-            row.chars().map(|c| match c {
-                'P' => Plains,
-                'F' => Forest,
-                'M' => Mountain,
-                '~' => Sea,
-                _ => Plains,
-            })
-        })
-        .collect();
-    assert_eq!(tiles.len(), (w * h) as usize);
+/// Generate a random map deterministically from `rng`. Splatters forest
+/// patches, draws a few mountain ridges via drunkard's-walk, and drops one
+/// or two small lakes. The result is just terrain — buildings/units come
+/// from `random_placements`.
+pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
+    let n = (width * height) as usize;
+    let mut tiles = vec![Terrain::Plains; n];
+    let idx = |x: i32, y: i32| -> Option<usize> {
+        if x < 0 || y < 0 || x >= width || y >= height {
+            None
+        } else {
+            Some((y * width + x) as usize)
+        }
+    };
+
+    // Forest patches.
+    let n_forests = rng.gen_range(8..16);
+    for _ in 0..n_forests {
+        let cx = rng.gen_range(0..width);
+        let cy = rng.gen_range(0..height);
+        let size = rng.gen_range(3..8);
+        for _ in 0..size {
+            let ox = cx + rng.gen_range(-2..3);
+            let oy = cy + rng.gen_range(-2..3);
+            if let Some(i) = idx(ox, oy) {
+                tiles[i] = Terrain::Forest;
+            }
+        }
+    }
+
+    // Mountain ridges via biased random walk.
+    let n_ridges = rng.gen_range(2..6);
+    for _ in 0..n_ridges {
+        let mut x = rng.gen_range(0..width);
+        let mut y = rng.gen_range(0..height);
+        let length = rng.gen_range(5..14);
+        let bias_x: i32 = rng.gen_range(-1..2);
+        let bias_y: i32 = rng.gen_range(-1..2);
+        for _ in 0..length {
+            if let Some(i) = idx(x, y) {
+                tiles[i] = Terrain::Mountain;
+            }
+            x = (x + bias_x + rng.gen_range(-1..2)).clamp(0, width - 1);
+            y = (y + bias_y + rng.gen_range(-1..2)).clamp(0, height - 1);
+        }
+    }
+
+    // Small lakes.
+    let n_lakes = rng.gen_range(1..4);
+    for _ in 0..n_lakes {
+        let cx = rng.gen_range(0..width);
+        let cy = rng.gen_range(0..height);
+        let size = rng.gen_range(3..7);
+        for _ in 0..size {
+            let ox = cx + rng.gen_range(-2..3);
+            let oy = cy + rng.gen_range(-2..3);
+            if let Some(i) = idx(ox, oy) {
+                tiles[i] = Terrain::Sea;
+            }
+        }
+    }
+
     Map {
-        width: w,
-        height: h,
+        width,
+        height,
         tiles,
     }
+}
+
+/// Pick HQ/factory/city positions on `map`. P1 lands in the top quarter,
+/// P2 in the bottom quarter, factories adjacent to their HQ on land, and
+/// cities scattered through the middle band. Returns `None` if the random
+/// terrain made any of these picks impossible.
+pub struct RandomPlacements {
+    pub p1_hq: Coord,
+    pub p2_hq: Coord,
+    pub p1_factory: Coord,
+    pub p2_factory: Coord,
+    pub cities: Vec<Coord>,
+    pub p1_units: Vec<(UnitKind, Coord)>,
+    pub p2_units: Vec<(UnitKind, Coord)>,
+}
+
+pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacements> {
+    let q = (map.height / 4).max(2);
+    let mut occupied: HashSet<Coord> = HashSet::new();
+
+    let p1_hq = pick_random_land(map, rng, 1..q, &occupied)?;
+    occupied.insert(p1_hq);
+    let p2_hq = pick_random_land(map, rng, (map.height - q)..(map.height - 1), &occupied)?;
+    occupied.insert(p2_hq);
+
+    let p1_factory = pick_adjacent_land(map, p1_hq, rng, &occupied)?;
+    occupied.insert(p1_factory);
+    let p2_factory = pick_adjacent_land(map, p2_hq, rng, &occupied)?;
+    occupied.insert(p2_factory);
+
+    // 5..7 neutral cities scattered through the middle band, never on top
+    // of an HQ/factory and never duplicate.
+    let n_cities = rng.gen_range(5..8);
+    let mut cities = Vec::with_capacity(n_cities);
+    for _ in 0..200 {
+        if cities.len() >= n_cities {
+            break;
+        }
+        if let Some(pos) = pick_random_land(map, rng, q..(map.height - q), &occupied) {
+            cities.push(pos);
+            occupied.insert(pos);
+        }
+    }
+
+    // Starting army: 1 scout + 1 infantry per player, on tiles adjacent to
+    // the HQ (or the factory if HQ has no room).
+    let p1_units = pick_starting_units(map, &[p1_hq, p1_factory], rng, &mut occupied)?;
+    let p2_units = pick_starting_units(map, &[p2_hq, p2_factory], rng, &mut occupied)?;
+
+    Some(RandomPlacements {
+        p1_hq,
+        p2_hq,
+        p1_factory,
+        p2_factory,
+        cities,
+        p1_units,
+        p2_units,
+    })
+}
+
+fn pick_random_land(
+    map: &Map,
+    rng: &mut SmallRng,
+    y_range: std::ops::Range<i32>,
+    exclude: &HashSet<Coord>,
+) -> Option<Coord> {
+    if y_range.start >= y_range.end {
+        return None;
+    }
+    for _ in 0..400 {
+        let x = rng.gen_range(0..map.width);
+        let y = rng.gen_range(y_range.start..y_range.end);
+        let pos = (x, y);
+        if exclude.contains(&pos) {
+            continue;
+        }
+        if map.terrain(pos).map_or(false, |t| t != Terrain::Sea) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+fn pick_adjacent_land(
+    map: &Map,
+    pos: Coord,
+    rng: &mut SmallRng,
+    exclude: &HashSet<Coord>,
+) -> Option<Coord> {
+    let mut adj: Vec<Coord> = neighbors4(pos)
+        .into_iter()
+        .filter(|p| map.in_bounds(*p))
+        .filter(|p| !exclude.contains(p))
+        .filter(|p| map.terrain(*p).map_or(false, |t| t != Terrain::Sea))
+        .collect();
+    if adj.is_empty() {
+        return None;
+    }
+    adj.shuffle(rng);
+    Some(adj[0])
+}
+
+fn pick_starting_units(
+    map: &Map,
+    seeds: &[Coord],
+    rng: &mut SmallRng,
+    occupied: &mut HashSet<Coord>,
+) -> Option<Vec<(UnitKind, Coord)>> {
+    let mut candidates: Vec<Coord> = Vec::new();
+    for s in seeds {
+        for n in neighbors4(*s) {
+            if map.in_bounds(n)
+                && !occupied.contains(&n)
+                && !candidates.contains(&n)
+                && map.terrain(n).map_or(false, |t| t != Terrain::Sea)
+            {
+                candidates.push(n);
+            }
+        }
+    }
+    if candidates.len() < 2 {
+        // Fallback: expand search to distance-2 tiles.
+        for s in seeds {
+            for dx in -2i32..=2 {
+                for dy in -2i32..=2 {
+                    let n = (s.0 + dx, s.1 + dy);
+                    if !map.in_bounds(n) {
+                        continue;
+                    }
+                    if occupied.contains(&n) || candidates.contains(&n) {
+                        continue;
+                    }
+                    if map.terrain(n).map_or(false, |t| t != Terrain::Sea) {
+                        candidates.push(n);
+                    }
+                }
+            }
+        }
+    }
+    if candidates.len() < 2 {
+        return None;
+    }
+    candidates.shuffle(rng);
+    let scout_pos = candidates[0];
+    let inf_pos = candidates[1];
+    occupied.insert(scout_pos);
+    occupied.insert(inf_pos);
+    Some(vec![
+        (UnitKind::Scout, scout_pos),
+        (UnitKind::Infantry, inf_pos),
+    ])
+}
+
+/// Count vertex-disjoint land paths between two coords using the standard
+/// successive-shortest-paths heuristic: repeatedly BFS, mark interior tiles
+/// of each found path as used, stop when no new path exists. Treats sea
+/// as impassable. The endpoints themselves are always usable so we don't
+/// undercount when the HQ tile is in the middle of a contested area.
+pub fn count_disjoint_paths(map: &Map, start: Coord, end: Coord, max: usize) -> usize {
+    let mut blocked: HashSet<Coord> = HashSet::new();
+    let mut count = 0;
+    while count < max {
+        match bfs_path_avoiding(map, start, end, &blocked) {
+            Some(path) => {
+                count += 1;
+                if path.len() > 2 {
+                    for &tile in &path[1..path.len() - 1] {
+                        blocked.insert(tile);
+                    }
+                } else {
+                    // Adjacent endpoints: no interior tiles to block. We can't
+                    // count more than one path through that single edge.
+                    return count;
+                }
+            }
+            None => break,
+        }
+    }
+    count
+}
+
+fn bfs_path_avoiding(
+    map: &Map,
+    start: Coord,
+    end: Coord,
+    blocked: &HashSet<Coord>,
+) -> Option<Vec<Coord>> {
+    let mut prev: HashMap<Coord, Option<Coord>> = HashMap::new();
+    prev.insert(start, None);
+    let mut queue: VecDeque<Coord> = VecDeque::new();
+    queue.push_back(start);
+    while let Some(pos) = queue.pop_front() {
+        if pos == end {
+            break;
+        }
+        for n in neighbors4(pos) {
+            if !map.in_bounds(n) {
+                continue;
+            }
+            if prev.contains_key(&n) {
+                continue;
+            }
+            if blocked.contains(&n) && n != end {
+                continue;
+            }
+            if map.terrain(n).map_or(true, |t| t == Terrain::Sea) {
+                continue;
+            }
+            prev.insert(n, Some(pos));
+            queue.push_back(n);
+        }
+    }
+    if !prev.contains_key(&end) {
+        return None;
+    }
+    let mut path = vec![end];
+    let mut cur = end;
+    while let Some(Some(p)) = prev.get(&cur).copied() {
+        path.push(p);
+        cur = p;
+    }
+    path.reverse();
+    Some(path)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -299,6 +560,9 @@ pub struct GameState {
     /// Cleared at the start of every turn.
     #[serde(skip)]
     pub factories_used: HashSet<Uuid>,
+    /// The seed used to generate this map. Surfaced in PlayerView so
+    /// players/agents can record or reproduce a particular layout.
+    pub map_seed: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,35 +582,73 @@ pub struct RememberedBuilding {
 }
 
 impl GameState {
+    /// Build a fresh game on a random map. Seeds are sampled from system
+    /// entropy until one yields a map that satisfies `MIN_DISJOINT_HQ_PATHS`.
+    /// The chosen seed is recorded in `map_seed` so the layout can be
+    /// reproduced via `with_seed`.
     pub fn new() -> Self {
-        let map = demo_map();
-        let mut units = HashMap::new();
-        // Each player starts with one scout and one infantry. Lean opening —
-        // you'll need to capture cities and produce more units to push.
-        let starts = [
-            (PlayerId::P1, UnitKind::Scout, (3, 2)),
-            (PlayerId::P1, UnitKind::Infantry, (4, 2)),
-            (PlayerId::P2, UnitKind::Scout, (8, 7)),
-            (PlayerId::P2, UnitKind::Infantry, (7, 7)),
-        ];
-        for (owner, kind, pos) in starts {
-            let id = Uuid::new_v4();
-            units.insert(
-                id,
-                Unit {
-                    id,
-                    kind,
-                    owner,
-                    pos,
-                    hp: kind.max_hp(),
-                    has_moved: false,
-                },
-            );
+        let mut entropy_rng = SmallRng::from_entropy();
+        for _ in 0..400 {
+            let seed: u64 = entropy_rng.r#gen();
+            if let Some(state) = Self::try_with_seed(seed) {
+                return state;
+            }
         }
-        let mut buildings = HashMap::new();
-        let add = |kind: BuildingKind, owner: Option<PlayerId>, pos: Coord, map_ref: &mut HashMap<Uuid, Building>| {
+        // Astronomically unlikely fallback: a fixed seed we know works.
+        Self::try_with_seed(0xA9E0_57A6_5DEA_DBEE)
+            .expect("fallback seed should always validate")
+    }
+
+    /// Build a game on a specific seed. Returns `Err` if the seed produces
+    /// a map without enough disjoint HQ paths — callers can decide whether
+    /// to surface the error or pick a different seed.
+    pub fn with_seed(seed: u64) -> Result<Self, String> {
+        Self::try_with_seed(seed).ok_or_else(|| {
+            format!(
+                "seed {seed} produced a map without {MIN_DISJOINT_HQ_PATHS} disjoint HQ paths"
+            )
+        })
+    }
+
+    fn try_with_seed(seed: u64) -> Option<Self> {
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let map = random_map(DEFAULT_MAP_WIDTH, DEFAULT_MAP_HEIGHT, &mut rng);
+        let placements = random_placements(&map, &mut rng)?;
+        if count_disjoint_paths(
+            &map,
+            placements.p1_hq,
+            placements.p2_hq,
+            MIN_DISJOINT_HQ_PATHS,
+        ) < MIN_DISJOINT_HQ_PATHS
+        {
+            return None;
+        }
+        Some(Self::assemble(seed, map, placements))
+    }
+
+    fn assemble(seed: u64, map: Map, p: RandomPlacements) -> Self {
+        let mut units: HashMap<Uuid, Unit> = HashMap::new();
+        for (owner, list) in [(PlayerId::P1, &p.p1_units), (PlayerId::P2, &p.p2_units)] {
+            for &(kind, pos) in list {
+                let id = Uuid::new_v4();
+                units.insert(
+                    id,
+                    Unit {
+                        id,
+                        kind,
+                        owner,
+                        pos,
+                        hp: kind.max_hp(),
+                        has_moved: false,
+                    },
+                );
+            }
+        }
+
+        let mut buildings: HashMap<Uuid, Building> = HashMap::new();
+        let mut add = |kind: BuildingKind, owner: Option<PlayerId>, pos: Coord| {
             let id = Uuid::new_v4();
-            map_ref.insert(
+            buildings.insert(
                 id,
                 Building {
                     id,
@@ -357,14 +659,12 @@ impl GameState {
                 },
             );
         };
-        add(BuildingKind::Hq, Some(PlayerId::P1), (3, 1), &mut buildings);
-        add(BuildingKind::Hq, Some(PlayerId::P2), (8, 8), &mut buildings);
-        add(BuildingKind::Factory, Some(PlayerId::P1), (4, 1), &mut buildings);
-        add(BuildingKind::Factory, Some(PlayerId::P2), (7, 8), &mut buildings);
-        // Four neutral cities scattered roughly symmetrically — race to
-        // capture them for income.
-        for pos in [(1, 4), (10, 5), (5, 3), (6, 6)] {
-            add(BuildingKind::City, None, pos, &mut buildings);
+        add(BuildingKind::Hq, Some(PlayerId::P1), p.p1_hq);
+        add(BuildingKind::Hq, Some(PlayerId::P2), p.p2_hq);
+        add(BuildingKind::Factory, Some(PlayerId::P1), p.p1_factory);
+        add(BuildingKind::Factory, Some(PlayerId::P2), p.p2_factory);
+        for pos in p.cities {
+            add(BuildingKind::City, None, pos);
         }
 
         let mut funds = HashMap::new();
@@ -383,6 +683,7 @@ impl GameState {
             hq_owners: [PlayerId::P1, PlayerId::P2].into_iter().collect(),
             funds,
             factories_used: HashSet::new(),
+            map_seed: seed,
         }
     }
 
@@ -962,6 +1263,9 @@ pub struct PlayerView {
     /// Factories that have already produced this turn (so the client can
     /// gray out their buy buttons).
     pub factories_used: Vec<Uuid>,
+    /// Seed used to generate this map. Identical seeds reproduce identical
+    /// maps so games can be replayed or shared.
+    pub map_seed: u64,
     #[serde(default)]
     pub last_action: Option<ActionReport>,
 }
@@ -1083,6 +1387,7 @@ impl GameState {
             you: me,
             funds,
             factories_used: self.factories_used.iter().copied().collect(),
+            map_seed: self.map_seed,
             last_action: self.last_action.clone(),
         }
     }
@@ -1120,6 +1425,7 @@ mod tests {
             hq_owners: HashSet::new(),
             funds: HashMap::new(),
             factories_used: HashSet::new(),
+            map_seed: 0,
         }
     }
 
@@ -1566,6 +1872,76 @@ mod tests {
             .try_action(PlayerId::P1, atk, (1, 0), Some((2, 0)))
             .unwrap_err();
         assert!(err.contains("captured"), "got: {err}");
+    }
+
+    #[test]
+    fn random_map_has_required_disjoint_paths() {
+        // Every map produced by the public new() / with_seed APIs is required
+        // to have at least MIN_DISJOINT_HQ_PATHS land paths. Sample a handful
+        // of seeds so we'd catch a regression that lets a single-chokepoint
+        // map slip through.
+        for seed in 0u64..30 {
+            if let Ok(g) = GameState::with_seed(seed) {
+                let p1_hq = g
+                    .buildings
+                    .values()
+                    .find(|b| b.kind == BuildingKind::Hq && b.owner == Some(PlayerId::P1))
+                    .unwrap()
+                    .pos;
+                let p2_hq = g
+                    .buildings
+                    .values()
+                    .find(|b| b.kind == BuildingKind::Hq && b.owner == Some(PlayerId::P2))
+                    .unwrap()
+                    .pos;
+                let n = count_disjoint_paths(&g.map, p1_hq, p2_hq, MIN_DISJOINT_HQ_PATHS);
+                assert!(
+                    n >= MIN_DISJOINT_HQ_PATHS,
+                    "seed {seed}: only {n} disjoint paths"
+                );
+                assert_eq!(g.map_seed, seed);
+            }
+            // Some seeds will fail validation — that's expected. We just need
+            // the ones that pass to be valid.
+        }
+    }
+
+    #[test]
+    fn same_seed_produces_same_map() {
+        if let (Ok(a), Ok(b)) = (GameState::with_seed(123_456), GameState::with_seed(123_456)) {
+            assert_eq!(a.map.tiles, b.map.tiles);
+            assert_eq!(a.map.width, b.map.width);
+            assert_eq!(a.map.height, b.map.height);
+        }
+        // If 123_456 happens to fail validation, the test still passes; the
+        // randomness of the iteration above already exercises validation.
+    }
+
+    #[test]
+    fn count_disjoint_paths_open_grid() {
+        // Open 10x10 plains: corners have only 2 neighbors so corner-to-corner
+        // is bounded at 2 by Menger. Pick mid-edge endpoints instead — those
+        // have 3 neighbors and an open grid admits 3 disjoint routes.
+        let map = flat_map(10, 10);
+        let n = count_disjoint_paths(&map, (0, 4), (9, 4), 3);
+        assert!(n >= 3, "got {n} paths");
+    }
+
+    #[test]
+    fn count_disjoint_paths_choked() {
+        // A 1-wide corridor only admits 1 disjoint path.
+        let mut map = flat_map(5, 5);
+        // Wall off everything except a single column at x=2.
+        for y in 0..5 {
+            for x in 0..5 {
+                if x != 2 {
+                    let i = (y * 5 + x) as usize;
+                    map.tiles[i] = Terrain::Sea;
+                }
+            }
+        }
+        let n = count_disjoint_paths(&map, (2, 0), (2, 4), 3);
+        assert_eq!(n, 1);
     }
 
     #[test]

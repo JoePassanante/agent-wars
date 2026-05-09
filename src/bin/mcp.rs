@@ -367,8 +367,17 @@ fn list_tools() -> Vec<Value> {
         }),
         json!({
             "name": "reset_lobby",
-            "description": "Reset the entire match to its starting state. All connected clients (browser, agents) re-sync.",
-            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+            "description": "Reset the entire match to a fresh start. By default a new random map is generated. Pass `seed` (u64) to reproduce a specific map; the seed is rejected if it doesn't yield a map with at least 3 disjoint HQ paths. The current map's seed is reported in get_state and at the top of every action response.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "seed": {
+                        "type": "integer",
+                        "description": "Optional u64 seed for deterministic map generation. Omit for a fresh random map."
+                    }
+                },
+                "required": []
+            }
         }),
     ]
 }
@@ -387,7 +396,7 @@ async fn dispatch_tool(
         "end_turn" => handle_end_turn(client).await,
         "wait_for_turn" => handle_wait_for_turn(client, args).await,
         "surrender" => handle_surrender(client).await,
-        "reset_lobby" => handle_reset(client).await,
+        "reset_lobby" => handle_reset(client, args).await,
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -705,16 +714,20 @@ async fn handle_surrender(client: &Arc<McpClient>) -> Result<String, String> {
     }
 }
 
-async fn handle_reset(client: &Arc<McpClient>) -> Result<String, String> {
+async fn handle_reset(client: &Arc<McpClient>, args: &Value) -> Result<String, String> {
+    let seed = args.get("seed").and_then(|v| v.as_u64());
     let mut events = client.events.subscribe();
     client
         .cmd_tx
-        .send(ClientMsg::Reset)
+        .send(ClientMsg::Reset { seed })
         .await
         .map_err(|_| "writer task dead".to_string())?;
     match wait_for_response(&mut events).await? {
         ServerMsg::Error { message } => Err(message),
-        ServerMsg::State(_) => Ok("Lobby reset to fresh state.\n".into()),
+        ServerMsg::State(view) => Ok(format!(
+            "Lobby reset to fresh state. Map seed: {}.\n",
+            view.map_seed
+        )),
         _ => Err("unexpected server response".into()),
     }
 }
@@ -771,6 +784,7 @@ fn synthetic_state(view: &PlayerView) -> GameState {
         hq_owners: std::collections::HashSet::new(),
         funds: HashMap::new(),
         factories_used: std::collections::HashSet::new(),
+        map_seed: view.map_seed,
     }
 }
 
@@ -801,8 +815,8 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
          on them, not destroyed. Surrender is allowed from turn 4 onward.\n\n",
     );
     s.push_str(&format!(
-        "Turn {}; active player: {:?}; you are {:?}.\n",
-        view.turn_number, view.current_turn, me
+        "Map seed: {}. Turn {}; active player: {:?}; you are {:?}.\n",
+        view.map_seed, view.turn_number, view.current_turn, me
     ));
     if let Some(w) = view.winner {
         let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
@@ -1059,9 +1073,15 @@ fn format_action_report(
     }
 
     if let Some(target_pos) = target {
-        // Locate the defender via their previous-state position.
-        let prev_target = prev.units.iter().find(|u| u.pos == target_pos).cloned();
-        if let Some(prev_t) = prev_target {
+        // Look for the target as either a unit OR a building from the prior state.
+        let prev_unit_target = prev.units.iter().find(|u| u.pos == target_pos).cloned();
+        let prev_building_target = prev
+            .buildings
+            .iter()
+            .find(|rb| rb.building.pos == target_pos)
+            .cloned();
+
+        if let Some(prev_t) = prev_unit_target {
             let new_target = new.units.iter().find(|u| u.id == prev_t.id);
             match new_target {
                 None => {
@@ -1075,6 +1095,31 @@ fn format_action_report(
                     s.push_str(&format!(
                         "Dealt {} HP to {}; defender now {} HP.\n",
                         dmg, prev_t.id, nt.hp
+                    ));
+                }
+            }
+        } else if let Some(prev_b) = prev_building_target {
+            let new_b = new
+                .buildings
+                .iter()
+                .find(|rb| rb.building.id == prev_b.building.id);
+            let kind_label = match prev_b.building.kind {
+                agent_wars::game::BuildingKind::Hq => "HQ",
+                agent_wars::game::BuildingKind::Factory => "factory",
+                agent_wars::game::BuildingKind::City => "city",
+            };
+            match new_b {
+                None => {
+                    s.push_str(&format!(
+                        "Enemy {} at [{},{}] DESTROYED!\n",
+                        kind_label, target_pos.0, target_pos.1
+                    ));
+                }
+                Some(nb) => {
+                    let dmg = prev_b.building.hp.saturating_sub(nb.building.hp);
+                    s.push_str(&format!(
+                        "Dealt {} HP to enemy {}; now {} HP.\n",
+                        dmg, kind_label, nb.building.hp
                     ));
                 }
             }

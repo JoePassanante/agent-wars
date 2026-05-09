@@ -28,8 +28,13 @@ pub enum ClientMsg {
     /// elapsed (turn_number >= 4) so a player can't bail out instantly.
     Surrender,
     /// Reset the lobby — wipe game state and start a fresh match.
-    /// Allowed from any connected client (player or spectator).
-    Reset,
+    /// Allowed from any connected client (player or spectator). If a `seed`
+    /// is provided, the new map is generated deterministically from it
+    /// (and rejected if it can't satisfy the disjoint-paths requirement).
+    Reset {
+        #[serde(default)]
+        seed: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
