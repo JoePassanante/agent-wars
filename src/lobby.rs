@@ -193,8 +193,11 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Persist a replay to disk and (after 60s) remove the session from the
-/// lobby. Called by the WS layer once a winner is set.
+/// Persist a replay to disk and schedule the session for removal after 60s.
+/// `user_index` entries for the two players are freed IMMEDIATELY so they
+/// can re-queue for a new match without waiting for GC; only the
+/// `sessions` entry lingers so any still-attached spectators (or the
+/// players' old connections) can see the final state for the grace period.
 pub fn schedule_session_finish(state: AppState, session: Arc<SessionRef>, winner: Option<PlayerId>) {
     let session_id = session.id;
     tokio::spawn(async move {
@@ -215,21 +218,26 @@ pub fn schedule_session_finish(state: AppState, session: Arc<SessionRef>, winner
             tracing::warn!("failed to persist replay {}: {e}", session_id);
         }
 
-        tokio::time::sleep(Duration::from_secs(60)).await;
-
-        let mut lobby = state.lobby.lock().await;
-        lobby.sessions.remove(&session_id);
-        // Free user_index entries so players can queue again.
-        for username in session.players.values() {
-            if let Some(UserPresence::InSession {
-                session_id: sid, ..
-            }) = lobby.user_index.get(username)
-            {
-                if *sid == session_id {
-                    lobby.user_index.remove(username);
+        // Free user_index immediately so a new Hello with the same username
+        // queues fresh instead of reconnecting into the dead session.
+        {
+            let mut lobby = state.lobby.lock().await;
+            for username in session.players.values() {
+                if let Some(UserPresence::InSession {
+                    session_id: sid, ..
+                }) = lobby.user_index.get(username)
+                {
+                    if *sid == session_id {
+                        lobby.user_index.remove(username);
+                    }
                 }
             }
         }
+
+        // 60s grace period for spectators, then drop the session.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let mut lobby = state.lobby.lock().await;
+        lobby.sessions.remove(&session_id);
     });
 }
 
