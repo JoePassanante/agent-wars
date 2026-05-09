@@ -241,11 +241,17 @@ impl Map {
     }
 }
 
-/// Generate a random map deterministically from `rng`. Splatters forest
-/// patches, draws a few mountain ridges via drunkard's-walk, and drops one
-/// or two small lakes. The result is just terrain — buildings/units come
-/// from `random_placements`.
+/// Generate a random map deterministically from `rng`, mirrored across the
+/// horizontal midline so neither player has a positional advantage. We
+/// scatter terrain features in the TOP half only, then copy the result to
+/// the bottom half via vertical reflection. Map height must be even so the
+/// midline lies between rows.
 pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
+    assert!(
+        height >= 2 && height % 2 == 0,
+        "mirrored maps require an even height >= 2"
+    );
+    let half = height / 2;
     let n = (width * height) as usize;
     let mut tiles = vec![Terrain::Plains; n];
     let idx = |x: i32, y: i32| -> Option<usize> {
@@ -255,51 +261,63 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
             Some((y * width + x) as usize)
         }
     };
+    let stamp = |tiles: &mut [Terrain], pos: Coord, terrain: Terrain| {
+        if pos.1 < 0 || pos.1 >= half {
+            return; // top-half-only generation
+        }
+        if let Some(i) = idx(pos.0, pos.1) {
+            tiles[i] = terrain;
+        }
+    };
 
-    // Forest patches.
-    let n_forests = rng.gen_range(8..16);
+    // Forest patches in the top half.
+    let n_forests = rng.gen_range(5..10);
     for _ in 0..n_forests {
         let cx = rng.gen_range(0..width);
-        let cy = rng.gen_range(0..height);
+        let cy = rng.gen_range(0..half);
         let size = rng.gen_range(3..8);
         for _ in 0..size {
             let ox = cx + rng.gen_range(-2..3);
             let oy = cy + rng.gen_range(-2..3);
-            if let Some(i) = idx(ox, oy) {
-                tiles[i] = Terrain::Forest;
-            }
+            stamp(&mut tiles, (ox, oy), Terrain::Forest);
         }
     }
 
-    // Mountain ridges via biased random walk.
-    let n_ridges = rng.gen_range(2..6);
+    // Mountain ridges via biased random walk, top half.
+    let n_ridges = rng.gen_range(1..4);
     for _ in 0..n_ridges {
         let mut x = rng.gen_range(0..width);
-        let mut y = rng.gen_range(0..height);
+        let mut y = rng.gen_range(0..half);
         let length = rng.gen_range(5..14);
         let bias_x: i32 = rng.gen_range(-1..2);
         let bias_y: i32 = rng.gen_range(-1..2);
         for _ in 0..length {
-            if let Some(i) = idx(x, y) {
-                tiles[i] = Terrain::Mountain;
-            }
+            stamp(&mut tiles, (x, y), Terrain::Mountain);
             x = (x + bias_x + rng.gen_range(-1..2)).clamp(0, width - 1);
-            y = (y + bias_y + rng.gen_range(-1..2)).clamp(0, height - 1);
+            y = (y + bias_y + rng.gen_range(-1..2)).clamp(0, half - 1);
         }
     }
 
-    // Small lakes.
-    let n_lakes = rng.gen_range(1..4);
+    // Small lakes, top half.
+    let n_lakes = rng.gen_range(0..3);
     for _ in 0..n_lakes {
         let cx = rng.gen_range(0..width);
-        let cy = rng.gen_range(0..height);
+        let cy = rng.gen_range(0..half);
         let size = rng.gen_range(3..7);
         for _ in 0..size {
             let ox = cx + rng.gen_range(-2..3);
             let oy = cy + rng.gen_range(-2..3);
-            if let Some(i) = idx(ox, oy) {
-                tiles[i] = Terrain::Sea;
-            }
+            stamp(&mut tiles, (ox, oy), Terrain::Sea);
+        }
+    }
+
+    // Reflect top half onto bottom half so (x, y) and (x, height-1-y) are
+    // identical for every y < half.
+    for y in 0..half {
+        for x in 0..width {
+            let src = (y * width + x) as usize;
+            let dst = ((height - 1 - y) * width + x) as usize;
+            tiles[dst] = tiles[src];
         }
     }
 
@@ -308,6 +326,11 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
         height,
         tiles,
     }
+}
+
+/// Reflect a coord across the horizontal midline of a map of the given height.
+fn mirror_y(height: i32, pos: Coord) -> Coord {
+    (pos.0, height - 1 - pos.1)
 }
 
 /// Pick HQ/factory/city positions on `map`. P1 lands in the top quarter,
@@ -325,37 +348,65 @@ pub struct RandomPlacements {
 }
 
 pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacements> {
+    let half = map.height / 2;
     let q = (map.height / 4).max(2);
     let mut occupied: HashSet<Coord> = HashSet::new();
 
-    let p1_hq = pick_random_land(map, rng, 1..q, &occupied)?;
+    // P1 is placed in the top half; P2 is the exact mirror across the midline.
+    let p1_hq = pick_random_buildable(map, rng, 1..q, &occupied)?;
+    let p2_hq = mirror_y(map.height, p1_hq);
+    if p1_hq == p2_hq {
+        return None; // shouldn't happen on an even-height map but guard anyway
+    }
     occupied.insert(p1_hq);
-    let p2_hq = pick_random_land(map, rng, (map.height - q)..(map.height - 1), &occupied)?;
     occupied.insert(p2_hq);
 
-    let p1_factory = pick_adjacent_land(map, p1_hq, rng, &occupied)?;
+    let p1_factory = pick_adjacent_buildable(map, p1_hq, rng, &occupied)?;
+    let p2_factory = mirror_y(map.height, p1_factory);
     occupied.insert(p1_factory);
-    let p2_factory = pick_adjacent_land(map, p2_hq, rng, &occupied)?;
     occupied.insert(p2_factory);
 
-    // 5..7 neutral cities scattered through the middle band, never on top
-    // of an HQ/factory and never duplicate.
-    let n_cities = rng.gen_range(5..8);
-    let mut cities = Vec::with_capacity(n_cities);
-    for _ in 0..200 {
-        if cities.len() >= n_cities {
+    // Cities come in mirrored pairs in the upper-middle ↔ lower-middle bands.
+    // Each pick chooses one tile in the top middle band [q, half) and we
+    // automatically place its reflection.
+    let n_pairs = rng.gen_range(3..6);
+    let mut cities = Vec::with_capacity(n_pairs * 2);
+    for _ in 0..400 {
+        if cities.len() >= n_pairs * 2 {
             break;
         }
-        if let Some(pos) = pick_random_land(map, rng, q..(map.height - q), &occupied) {
-            cities.push(pos);
-            occupied.insert(pos);
+        let Some(pos) = pick_random_buildable(map, rng, q..half, &occupied) else {
+            break;
+        };
+        let mirror = mirror_y(map.height, pos);
+        if mirror == pos || occupied.contains(&mirror) {
+            continue;
         }
+        // Mirror tile must also be buildable. The map is mirrored so this
+        // should always hold, but verify.
+        if !map.terrain(mirror).map_or(false, is_buildable) {
+            continue;
+        }
+        cities.push(pos);
+        cities.push(mirror);
+        occupied.insert(pos);
+        occupied.insert(mirror);
     }
 
-    // Starting army: 1 scout + 1 infantry per player, on tiles adjacent to
-    // the HQ (or the factory if HQ has no room).
+    // Starting army: pick P1 unit positions, mirror to P2.
     let p1_units = pick_starting_units(map, &[p1_hq, p1_factory], rng, &mut occupied)?;
-    let p2_units = pick_starting_units(map, &[p2_hq, p2_factory], rng, &mut occupied)?;
+    let mut p2_units = Vec::with_capacity(p1_units.len());
+    for &(kind, pos) in &p1_units {
+        let mpos = mirror_y(map.height, pos);
+        if occupied.contains(&mpos) {
+            return None;
+        }
+        if !map.terrain(mpos).map_or(false, is_passable) {
+            return None;
+        }
+        occupied.insert(mpos);
+        p2_units.push((kind, mpos));
+    }
 
     Some(RandomPlacements {
         p1_hq,
@@ -368,7 +419,19 @@ pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacemen
     })
 }
 
-fn pick_random_land(
+/// Buildings (HQ, factory, city) can only be placed on plains. Mountains
+/// and forests are passable terrain features for units, not building lots,
+/// and sea is impassable entirely.
+fn is_buildable(t: Terrain) -> bool {
+    matches!(t, Terrain::Plains)
+}
+
+/// Units can spawn or stand on any non-sea tile.
+fn is_passable(t: Terrain) -> bool {
+    !matches!(t, Terrain::Sea)
+}
+
+fn pick_random_buildable(
     map: &Map,
     rng: &mut SmallRng,
     y_range: std::ops::Range<i32>,
@@ -384,14 +447,14 @@ fn pick_random_land(
         if exclude.contains(&pos) {
             continue;
         }
-        if map.terrain(pos).map_or(false, |t| t != Terrain::Sea) {
+        if map.terrain(pos).map_or(false, is_buildable) {
             return Some(pos);
         }
     }
     None
 }
 
-fn pick_adjacent_land(
+fn pick_adjacent_buildable(
     map: &Map,
     pos: Coord,
     rng: &mut SmallRng,
@@ -401,7 +464,7 @@ fn pick_adjacent_land(
         .into_iter()
         .filter(|p| map.in_bounds(*p))
         .filter(|p| !exclude.contains(p))
-        .filter(|p| map.terrain(*p).map_or(false, |t| t != Terrain::Sea))
+        .filter(|p| map.terrain(*p).map_or(false, is_buildable))
         .collect();
     if adj.is_empty() {
         return None;
@@ -1903,6 +1966,46 @@ mod tests {
             }
             // Some seeds will fail validation — that's expected. We just need
             // the ones that pass to be valid.
+        }
+    }
+
+    #[test]
+    fn map_is_mirror_symmetric_and_buildings_on_plains() {
+        // Sample seeds that pass validation and check that:
+        //   - terrain(x, y) == terrain(x, height-1-y) for every cell
+        //   - every building sits on a Plains tile
+        //   - every P1 piece (HQ, factory, unit) has a mirror P2 piece
+        for seed in 0u64..40 {
+            let Ok(g) = GameState::with_seed(seed) else { continue };
+            let h = g.map.height;
+            for y in 0..h / 2 {
+                for x in 0..g.map.width {
+                    assert_eq!(
+                        g.map.terrain((x, y)),
+                        g.map.terrain((x, h - 1 - y)),
+                        "seed {seed}: map not mirrored at ({x},{y})",
+                    );
+                }
+            }
+            for b in g.buildings.values() {
+                assert_eq!(
+                    g.map.terrain(b.pos),
+                    Some(Terrain::Plains),
+                    "seed {seed}: building at {:?} on non-plains",
+                    b.pos
+                );
+            }
+            // Building mirror invariant.
+            for owner in [PlayerId::P1] {
+                for b in g.buildings.values().filter(|b| b.owner == Some(owner)) {
+                    let mirror = (b.pos.0, h - 1 - b.pos.1);
+                    let exists = g
+                        .buildings
+                        .values()
+                        .any(|m| m.pos == mirror && m.kind == b.kind && m.owner == Some(owner.other()));
+                    assert!(exists, "seed {seed}: no mirrored {:?} for {:?}", b.kind, b.pos);
+                }
+            }
         }
     }
 
