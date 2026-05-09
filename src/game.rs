@@ -311,12 +311,15 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
         }
     }
 
-    // Reflect top half onto bottom half so (x, y) and (x, height-1-y) are
-    // identical for every y < half.
+    // 180° rotation through the map center: (x, y) ↔ (width-1-x, height-1-y).
+    // Each top-half tile populates its bottom-half partner so the two players
+    // start on opposite corners with identical terrain.
     for y in 0..half {
         for x in 0..width {
             let src = (y * width + x) as usize;
-            let dst = ((height - 1 - y) * width + x) as usize;
+            let mx = width - 1 - x;
+            let my = height - 1 - y;
+            let dst = (my * width + mx) as usize;
             tiles[dst] = tiles[src];
         }
     }
@@ -328,9 +331,9 @@ pub fn random_map(width: i32, height: i32, rng: &mut SmallRng) -> Map {
     }
 }
 
-/// Reflect a coord across the horizontal midline of a map of the given height.
-fn mirror_y(height: i32, pos: Coord) -> Coord {
-    (pos.0, height - 1 - pos.1)
+/// 180° rotation through the map center: P1's coord ↔ P2's coord.
+fn mirror_pos(width: i32, height: i32, pos: Coord) -> Coord {
+    (width - 1 - pos.0, height - 1 - pos.1)
 }
 
 /// Pick HQ/factory/city positions on `map`. P1 lands in the top quarter,
@@ -354,7 +357,7 @@ pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacemen
 
     // P1 is placed in the top half; P2 is the exact mirror across the midline.
     let p1_hq = pick_random_buildable(map, rng, 1..q, &occupied)?;
-    let p2_hq = mirror_y(map.height, p1_hq);
+    let p2_hq = mirror_pos(map.width, map.height,p1_hq);
     if p1_hq == p2_hq {
         return None; // shouldn't happen on an even-height map but guard anyway
     }
@@ -362,7 +365,7 @@ pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacemen
     occupied.insert(p2_hq);
 
     let p1_factory = pick_adjacent_buildable(map, p1_hq, rng, &occupied)?;
-    let p2_factory = mirror_y(map.height, p1_factory);
+    let p2_factory = mirror_pos(map.width, map.height,p1_factory);
     occupied.insert(p1_factory);
     occupied.insert(p2_factory);
 
@@ -378,7 +381,7 @@ pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacemen
         let Some(pos) = pick_random_buildable(map, rng, q..half, &occupied) else {
             break;
         };
-        let mirror = mirror_y(map.height, pos);
+        let mirror = mirror_pos(map.width, map.height,pos);
         if mirror == pos || occupied.contains(&mirror) {
             continue;
         }
@@ -397,7 +400,7 @@ pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacemen
     let p1_units = pick_starting_units(map, &[p1_hq, p1_factory], rng, &mut occupied)?;
     let mut p2_units = Vec::with_capacity(p1_units.len());
     for &(kind, pos) in &p1_units {
-        let mpos = mirror_y(map.height, pos);
+        let mpos = mirror_pos(map.width, map.height,pos);
         if occupied.contains(&mpos) {
             return None;
         }
@@ -1971,19 +1974,17 @@ mod tests {
 
     #[test]
     fn map_is_mirror_symmetric_and_buildings_on_plains() {
-        // Sample seeds that pass validation and check that:
-        //   - terrain(x, y) == terrain(x, height-1-y) for every cell
-        //   - every building sits on a Plains tile
-        //   - every P1 piece (HQ, factory, unit) has a mirror P2 piece
+        // 180° rotation through the map center: (x, y) ↔ (W-1-x, H-1-y).
         for seed in 0u64..40 {
             let Ok(g) = GameState::with_seed(seed) else { continue };
+            let w = g.map.width;
             let h = g.map.height;
-            for y in 0..h / 2 {
-                for x in 0..g.map.width {
+            for y in 0..h {
+                for x in 0..w {
                     assert_eq!(
                         g.map.terrain((x, y)),
-                        g.map.terrain((x, h - 1 - y)),
-                        "seed {seed}: map not mirrored at ({x},{y})",
+                        g.map.terrain((w - 1 - x, h - 1 - y)),
+                        "seed {seed}: map not 180°-symmetric at ({x},{y})",
                     );
                 }
             }
@@ -1995,16 +1996,20 @@ mod tests {
                     b.pos
                 );
             }
-            // Building mirror invariant.
-            for owner in [PlayerId::P1] {
-                for b in g.buildings.values().filter(|b| b.owner == Some(owner)) {
-                    let mirror = (b.pos.0, h - 1 - b.pos.1);
-                    let exists = g
-                        .buildings
-                        .values()
-                        .any(|m| m.pos == mirror && m.kind == b.kind && m.owner == Some(owner.other()));
-                    assert!(exists, "seed {seed}: no mirrored {:?} for {:?}", b.kind, b.pos);
-                }
+            for b in g
+                .buildings
+                .values()
+                .filter(|b| b.owner == Some(PlayerId::P1))
+            {
+                let mirror = (w - 1 - b.pos.0, h - 1 - b.pos.1);
+                let exists = g.buildings.values().any(|m| {
+                    m.pos == mirror && m.kind == b.kind && m.owner == Some(PlayerId::P2)
+                });
+                assert!(
+                    exists,
+                    "seed {seed}: no mirrored {:?} for {:?}",
+                    b.kind, b.pos
+                );
             }
         }
     }
