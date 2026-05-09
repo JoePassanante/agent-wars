@@ -622,30 +622,69 @@ function roundedRect(x, y, w, h, r) {
 function drawUnit(u, pos, isSelected) {
   const cx = pos[0] * TILE + TILE / 2;
   const cy = pos[1] * TILE + TILE / 2;
-  const r = TILE * 0.32;
 
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, Math.PI * 2);
   ctx.fillStyle = PLAYER_COLORS[u.owner] || "#aaa";
-  ctx.fill();
   ctx.lineWidth = 2;
   ctx.strokeStyle = u.hasMoved ? "#0008" : "#fff";
-  ctx.stroke();
+
+  // Each unit kind gets a distinct silhouette so you can read the board at a glance.
+  let badgeR;
+  if (u.kind === "scout") {
+    // Forward-leaning chevron — small, fast.
+    const r = TILE * 0.28;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - r);                // tip up
+    ctx.lineTo(cx + r * 0.95, cy + r * 0.55);
+    ctx.lineTo(cx, cy + r * 0.25);
+    ctx.lineTo(cx - r * 0.95, cy + r * 0.55);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    badgeR = r;
+  } else if (u.kind === "heavy_infantry") {
+    // Chunky rounded square — slow, tough.
+    const r = TILE * 0.34;
+    roundedRect(cx - r, cy - r, r * 2, r * 2, 6);
+    ctx.fill();
+    ctx.stroke();
+    // Inner stripe for the "armor" feel.
+    ctx.save();
+    ctx.fillStyle = "#0006";
+    ctx.fillRect(cx - r, cy - 2, r * 2, 4);
+    ctx.restore();
+    badgeR = r;
+  } else {
+    // Default: infantry circle.
+    const r = TILE * 0.30;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    badgeR = r;
+  }
+
+  // Single-letter label so the kind is unambiguous even without legend lookup.
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 12px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const letter = u.kind === "scout" ? "S" : u.kind === "heavy_infantry" ? "H" : "I";
+  ctx.fillText(letter, cx, cy + 1);
 
   if (u.hp < 10) {
     const w = 16, h = 12;
     ctx.fillStyle = "#000a";
-    ctx.fillRect(cx + r - w * 0.5, cy + r - h * 0.4, w, h);
+    ctx.fillRect(cx + badgeR - w * 0.5, cy + badgeR - h * 0.4, w, h);
     ctx.fillStyle = "#fff";
     ctx.font = "bold 10px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(String(u.hp), cx + r, cy + r + 1);
+    ctx.fillText(String(u.hp), cx + badgeR, cy + badgeR + 1);
   }
 
   if (isSelected) {
     ctx.beginPath();
-    ctx.arc(cx, cy, r + 4, 0, Math.PI * 2);
+    ctx.arc(cx, cy, badgeR + 5, 0, Math.PI * 2);
     ctx.strokeStyle = "#ffd84a";
     ctx.lineWidth = 2;
     ctx.stroke();

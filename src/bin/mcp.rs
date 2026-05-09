@@ -276,7 +276,7 @@ fn list_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "get_state",
-            "description": "Get the current game state from your player's perspective: turn number, whose turn it is, your units (id, position, hp, hasMoved), visible enemy units, terrain map (rendered ASCII + raw tiles), and fog-of-war coverage.",
+            "description": "Get the current game state from your player's perspective. The response includes a rules summary, turn info, your units, visible enemies, building list (yours / enemy with ghost-or-live tag / neutral), funds, and an ASCII map. WIN ONLY by destroying the enemy HQ (10 HP) or by their surrender — losing all your units does NOT end the game.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
@@ -303,7 +303,7 @@ fn list_tools() -> Vec<Value> {
         }),
         json!({
             "name": "act",
-            "description": "Move a unit and optionally attack. `to` is the destination [x, y] (use the unit's current position for a stationary attack). If `target` is set, the unit attacks the enemy at that coord (must be at Manhattan distance 1 from `to` for infantry). Server rules: defender counterattacks if it survives and is in range; sets has_moved on the attacker so the unit cannot act again this turn.",
+            "description": "Move a unit and optionally attack. `to` is the destination [x, y] (use the unit's current position to attack from where it stands). If `target` is set, the unit attacks the enemy AT that coord (must be at Manhattan distance 1 from `to`). Only enemy UNITS and HQs can be attacked — cities and factories are captured by ending your turn on them, not damaged. Defender counterattacks if it survives and is in range. Sets has_moved=true so the unit cannot act again this turn. Move a unit ONTO an enemy/neutral city or factory and then end_turn to capture it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -326,7 +326,7 @@ fn list_tools() -> Vec<Value> {
         }),
         json!({
             "name": "end_turn",
-            "description": "End your turn. The other player will then be active. The server resets has_moved flags for the player whose turn becomes active.",
+            "description": "End your turn. Before handing off, the server flips ownership of any capturable building (city/factory) one of your infantry-class units is standing on. Then the other player becomes active, their has_moved flags reset, and they collect income (1000g per HQ/factory/city they own). Each factory becomes available for production again at the start of its owner's turn.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
@@ -794,6 +794,12 @@ fn terrain_glyph(t: Terrain) -> char {
 
 fn format_state(view: &PlayerView, me: PlayerId) -> String {
     let mut s = String::new();
+    s.push_str(
+        "Rules: you win ONLY by destroying the enemy HQ (10 HP) or by their surrender. \
+         Losing all your units does NOT lose the game — you can rebuild at your \
+         factory or hold your HQ. Cities/factories are captured by ending your turn \
+         on them, not destroyed. Surrender is allowed from turn 4 onward.\n\n",
+    );
     s.push_str(&format!(
         "Turn {}; active player: {:?}; you are {:?}.\n",
         view.turn_number, view.current_turn, me

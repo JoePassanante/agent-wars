@@ -88,6 +88,22 @@ aside .hint { opacity: 0.65; line-height: 1.4; }
 .bldg.factory { background: #c80; border-radius: 0; }
 .bldg.city    { background: #4a8; border-radius: 50%; }
 
+.unit-badge {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
+  font: bold 11px system-ui, sans-serif;
+  color: #fff;
+  background: #888;
+  border: 2px solid #fff;
+  vertical-align: middle;
+}
+.unit-badge.unit-infantry { border-radius: 50%; }
+.unit-badge.unit-scout    { clip-path: polygon(50% 0, 100% 70%, 50% 55%, 0 70%); border-radius: 0; border: none; padding: 0; }
+.unit-badge.unit-heavy    { border-radius: 4px; }
+
 #buyPanel {
   margin-bottom: 12px;
   font-size: 12px;

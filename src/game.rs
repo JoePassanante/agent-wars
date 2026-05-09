@@ -666,10 +666,11 @@ impl GameState {
             }
         }
 
-        // Win check: each player loses if they have no units (rout) OR their
-        // HQ has been destroyed (only applies if they started with one).
-        let p1_routed = !self.units.values().any(|u| u.owner == PlayerId::P1);
-        let p2_routed = !self.units.values().any(|u| u.owner == PlayerId::P2);
+        // Win condition: a player loses ONLY when their HQ is destroyed
+        // (10 HP of damage) or they surrender. Running out of units is not
+        // an automatic loss — the routed player can still rebuild from a
+        // factory, capture cities to generate income, or hold their HQ until
+        // surrender becomes available.
         let p1_lost_hq = self.hq_owners.contains(&PlayerId::P1)
             && !self
                 .buildings
@@ -680,13 +681,11 @@ impl GameState {
                 .buildings
                 .values()
                 .any(|b| b.owner == Some(PlayerId::P2) && b.kind == BuildingKind::Hq);
-        let p1_lost = p1_routed || p1_lost_hq;
-        let p2_lost = p2_routed || p2_lost_hq;
-        if p1_lost && p2_lost {
+        if p1_lost_hq && p2_lost_hq {
             self.winner = Some(self.current_turn);
-        } else if p1_lost {
+        } else if p1_lost_hq {
             self.winner = Some(PlayerId::P2);
-        } else if p2_lost {
+        } else if p2_lost_hq {
             self.winner = Some(PlayerId::P1);
         }
 
@@ -1230,7 +1229,10 @@ mod tests {
     }
 
     #[test]
-    fn killing_last_enemy_wins() {
+    fn killing_last_enemy_does_not_win() {
+        // Win condition is HQ destruction or surrender. Wiping out all of an
+        // opponent's units is NOT an automatic win — they can rebuild from a
+        // factory or hold their HQ to force a surrender.
         let mut g = place(
             flat_map(5, 5),
             vec![(PlayerId::P1, (1, 0), 10), (PlayerId::P2, (2, 0), 1)],
@@ -1242,8 +1244,7 @@ mod tests {
             .unwrap();
         assert!(r.defender_killed);
         assert!(g.units.get(&def).is_none());
-        assert_eq!(g.winner, Some(PlayerId::P1));
-        // No counter from a dead unit.
+        assert_eq!(g.winner, None);
         assert_eq!(r.damage_to_attacker, None);
     }
 
