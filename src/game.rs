@@ -404,7 +404,7 @@ pub fn random_placements(map: &Map, rng: &mut SmallRng) -> Option<RandomPlacemen
         if occupied.contains(&mpos) {
             return None;
         }
-        if !map.terrain(mpos).map_or(false, is_passable) {
+        if !map.terrain(mpos).map_or(false, is_buildable) {
             return None;
         }
         occupied.insert(mpos);
@@ -482,33 +482,32 @@ fn pick_starting_units(
     rng: &mut SmallRng,
     occupied: &mut HashSet<Coord>,
 ) -> Option<Vec<(UnitKind, Coord)>> {
+    // Starting units spawn only on plains. Forests would hide them from the
+    // start (weird for an opening) and mountains slow first-turn movement
+    // for everything except heavy infantry. Pure plains keeps openings fair.
     let mut candidates: Vec<Coord> = Vec::new();
+    let mut consider = |candidates: &mut Vec<Coord>, n: Coord| {
+        if !map.in_bounds(n) {
+            return;
+        }
+        if occupied.contains(&n) || candidates.contains(&n) {
+            return;
+        }
+        if map.terrain(n).map_or(false, is_buildable) {
+            candidates.push(n);
+        }
+    };
     for s in seeds {
         for n in neighbors4(*s) {
-            if map.in_bounds(n)
-                && !occupied.contains(&n)
-                && !candidates.contains(&n)
-                && map.terrain(n).map_or(false, |t| t != Terrain::Sea)
-            {
-                candidates.push(n);
-            }
+            consider(&mut candidates, n);
         }
     }
     if candidates.len() < 2 {
-        // Fallback: expand search to distance-2 tiles.
+        // Fallback: widen search to distance-2 tiles around any seed.
         for s in seeds {
             for dx in -2i32..=2 {
                 for dy in -2i32..=2 {
-                    let n = (s.0 + dx, s.1 + dy);
-                    if !map.in_bounds(n) {
-                        continue;
-                    }
-                    if occupied.contains(&n) || candidates.contains(&n) {
-                        continue;
-                    }
-                    if map.terrain(n).map_or(false, |t| t != Terrain::Sea) {
-                        candidates.push(n);
-                    }
+                    consider(&mut candidates, (s.0 + dx, s.1 + dy));
                 }
             }
         }
@@ -1994,6 +1993,14 @@ mod tests {
                     Some(Terrain::Plains),
                     "seed {seed}: building at {:?} on non-plains",
                     b.pos
+                );
+            }
+            for u in g.units.values() {
+                assert_eq!(
+                    g.map.terrain(u.pos),
+                    Some(Terrain::Plains),
+                    "seed {seed}: starting unit at {:?} on non-plains",
+                    u.pos
                 );
             }
             for b in g
