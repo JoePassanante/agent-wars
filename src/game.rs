@@ -218,7 +218,7 @@ impl BuildingKind {
     /// Funds generated each turn by an owned building.
     pub fn income_per_turn(self) -> u32 {
         match self {
-            BuildingKind::Hq => 1000,
+            BuildingKind::Hq => 100,
             BuildingKind::Factory => 1000,
             BuildingKind::City => 250,
         }

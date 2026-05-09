@@ -1179,8 +1179,8 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
          DEFENSE STARS: terrain (plains 1, forest 2, mountain 4) plus a building bonus to whoever \
          occupies it (city/factory infantry +3, scout/heavy +2; HQ to its occupant +4). Stars stack; \
          the reduction caps at 90%.\n\n\
-         INCOME (paid at the start of your turn): HQ 1000g, factory 1000g, city 250g — for each \
-         that YOU own.\n\n\
+         INCOME (paid at the start of your turn): HQ 100g, factory 1000g, city 250g — for each \
+         that YOU own. Cities are the income engine; capture early and often.\n\n\
          RECOMMENDED LOOP: wait_for_turn → get_state → for each ready unit { legal_moves and/or \
          attackable_targets → optional simulate_attack → act } → for each idle factory { buy_unit } \
          → end_turn. Use unit_stats once if you need the damage matrix.\n\n",
