@@ -97,7 +97,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // Initial state push.
     {
-        let g = state.game.lock().await;
+        let mut g = state.game.lock().await;
         let view = g.view_for(join_view);
         if out_tx.send(ServerMsg::State(view)).await.is_err() {
             return;
@@ -110,7 +110,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let push_tx = out_tx.clone();
     let push = tokio::spawn(async move {
         while rx.recv().await.is_ok() {
-            let g = push_game.lock().await;
+            let mut g = push_game.lock().await;
             let view = g.view_for(join_view);
             if push_tx.send(ServerMsg::State(view)).await.is_err() {
                 break;
@@ -176,6 +176,12 @@ async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<
         }
         ClientMsg::EndTurn => {
             g.end_turn(actor)?;
+            drop(g);
+            let _ = state.tx.send(());
+            Ok(())
+        }
+        ClientMsg::Surrender => {
+            g.try_surrender(actor)?;
             drop(g);
             let _ = state.tx.send(());
             Ok(())

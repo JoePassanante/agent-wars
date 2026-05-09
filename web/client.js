@@ -1,16 +1,10 @@
 // agent-wars browser client
 //
-// Connects to ws://<host>/ws, picks a vantage, renders fog-filtered state.
-//
-// Click flow:
-//   1. Click a friendly infantry that hasn't acted -> highlight reachable tiles.
-//   2. Click a reachable tile -> if any adjacent enemies, enter "pick attack
-//      target"; otherwise send the move immediately.
-//   3. In attack mode, click an adjacent enemy to attack, or click the
-//      pending destination tile again to wait (move only). Click anywhere
-//      else to cancel.
+// Connects to ws://<host>/ws, picks a vantage, renders the fog-filtered state,
+// and animates units along their pathfinding path when they move.
 
 const TILE = 48;
+const STEP_MS = 140; // milliseconds per tile during animation
 
 const TERRAIN_COLORS = {
   plains:   "#4f7a3a",
@@ -24,6 +18,7 @@ const els = {
   role: document.getElementById("role"),
   connect: document.getElementById("connect"),
   endTurn: document.getElementById("endTurn"),
+  surrender: document.getElementById("surrender"),
   reset: document.getElementById("reset"),
   status: document.getElementById("status"),
   turnNumber: document.getElementById("turnNumber"),
@@ -35,12 +30,15 @@ const ctx = els.canvas.getContext("2d");
 
 let ws = null;
 let view = null;
-let state = null;       // last PlayerView received
-let selected = null;    // selected unit (object)
-let reachable = null;   // Set<"x,y"> while picking destination
-let pendingMove = null; // [x, y] of provisional destination
-let attackTargets = null; // Set<"x,y"> of enemy units we could attack from pendingMove
+let state = null;
+let selected = null;
+let reachable = null;
+let pendingMove = null;
+let attackTargets = null;
 let lastError = "";
+
+// Active move animation: { unitId, path: [[x,y],...], started: ms }
+let animation = null;
 
 els.connect.addEventListener("click", () => {
   if (ws) ws.close();
@@ -51,6 +49,11 @@ els.connect.addEventListener("click", () => {
   connect(view);
 });
 els.endTurn.addEventListener("click", () => send({ type: "endTurn" }));
+els.surrender.addEventListener("click", () => {
+  if (confirm("Surrender? The other player will win immediately.")) {
+    send({ type: "surrender" });
+  }
+});
 els.reset.addEventListener("click", () => {
   if (confirm("Reset the lobby? Everyone connected will see a fresh match.")) {
     send({ type: "reset" });
@@ -58,14 +61,13 @@ els.reset.addEventListener("click", () => {
 });
 
 els.canvas.addEventListener("contextmenu", (e) => {
-  // Right-click cancels current selection.
   e.preventDefault();
   clearSelection();
   render();
 });
 
 els.canvas.addEventListener("click", (e) => {
-  if (!state) return;
+  if (!state || animation) return;
   const rect = els.canvas.getBoundingClientRect();
   const x = Math.floor((e.clientX - rect.left) / TILE);
   const y = Math.floor((e.clientY - rect.top) / TILE);
@@ -74,7 +76,7 @@ els.canvas.addEventListener("click", (e) => {
   const me = state.you;
   const isMyTurn = me && state.currentTurn === me && !state.winner;
 
-  // Phase 3: provisional destination chosen — pick attack target or wait.
+  // Attack-pick mode (provisional move chosen).
   if (pendingMove) {
     const key = `${x},${y}`;
     if (attackTargets && attackTargets.has(key)) {
@@ -88,30 +90,33 @@ els.canvas.addEventListener("click", (e) => {
     clearSelection(); render(); return;
   }
 
-  // Phase 2: a unit is selected.
+  // Unit-selected mode.
   if (selected) {
-    const clicked = unitAt(x, y);
+    const enemyTargetUnit = unitAt(x, y);
+    const enemyTargetBuilding = buildingAt(x, y);
 
-    // Click an enemy that we can attack from somewhere reachable: auto-resolve.
-    if (clicked && clicked.owner !== me) {
+    // Click an enemy unit OR enemy HQ within reach -> auto-resolve.
+    const enemyTarget =
+      (enemyTargetUnit && enemyTargetUnit.owner !== me) ? enemyTargetUnit :
+      (enemyTargetBuilding && enemyTargetBuilding.owner !== me && enemyTargetBuilding.currentlyVisible) ? enemyTargetBuilding : null;
+    if (enemyTarget) {
       const standTile = findAttackPosition(selected, [x, y]);
       if (standTile) {
         send({ type: "move", unitId: selected.id, to: standTile, attack: [x, y] });
         clearSelection(); render(); return;
       }
-      // Out of range — fall through to cancel.
     }
 
-    // Click a different friendly unit: switch selection.
-    if (clicked && clicked.owner === me && clicked.id !== selected.id && !clicked.hasMoved) {
-      selected = clicked;
-      reachable = computeReachable(clicked);
+    // Click another own unit -> switch.
+    if (enemyTargetUnit && enemyTargetUnit.owner === me && enemyTargetUnit.id !== selected.id && !enemyTargetUnit.hasMoved) {
+      selected = enemyTargetUnit;
+      reachable = computeReachable(selected);
       render(); return;
     }
 
-    // Click a reachable empty tile: move (or enter attack-pick if enemies adjacent).
-    if (reachable && reachable.has(`${x},${y}`) && !clicked) {
-      const targets = enemiesAdjacentTo([x, y]);
+    // Click a reachable empty tile -> move (or enter attack-pick).
+    if (reachable && reachable.has(`${x},${y}`) && !enemyTargetUnit && !enemyTargetBuilding) {
+      const targets = adjacentEnemies([x, y]);
       if (targets.size > 0) {
         pendingMove = [x, y];
         attackTargets = targets;
@@ -122,11 +127,10 @@ els.canvas.addEventListener("click", (e) => {
       render(); return;
     }
 
-    // Otherwise: clicked nothing useful — cancel selection.
     clearSelection(); render(); return;
   }
 
-  // Phase 1: nothing selected.
+  // Idle: clicking a friendly unit selects it.
   if (!isMyTurn) return;
   const u = unitAt(x, y);
   if (u && u.owner === me && !u.hasMoved) {
@@ -157,20 +161,7 @@ function connect(viewValue) {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "state") {
-      state = msg;
-      // If our selected unit is gone or already acted, drop the selection.
-      if (selected) {
-        const fresh = state.units.find((u) => u.id === selected.id);
-        if (!fresh || fresh.hasMoved) {
-          clearSelection();
-        } else {
-          selected = fresh;
-          reachable = computeReachable(fresh);
-        }
-      }
-      lastError = "";
-      updateHud();
-      render();
+      handleState(msg);
     } else if (msg.type === "joined") {
       // ack
     } else if (msg.type === "error") {
@@ -179,6 +170,58 @@ function connect(viewValue) {
       updateHud();
     }
   });
+}
+
+function handleState(newState) {
+  // Start an animation if the action included a meaningful path.
+  if (
+    newState.lastAction &&
+    newState.lastAction.path &&
+    newState.lastAction.path.length > 1
+  ) {
+    animation = {
+      unitId: newState.lastAction.unitId,
+      path: newState.lastAction.path,
+      started: performance.now(),
+    };
+    requestAnimationFrame(tick);
+  }
+
+  state = newState;
+  if (selected) {
+    const fresh = state.units.find((u) => u.id === selected.id);
+    if (!fresh || fresh.hasMoved) clearSelection();
+    else { selected = fresh; reachable = computeReachable(fresh); }
+  }
+  lastError = "";
+  updateHud();
+  render();
+}
+
+function tick(now) {
+  if (!animation) return;
+  const elapsed = now - animation.started;
+  const totalMs = STEP_MS * (animation.path.length - 1);
+  if (elapsed >= totalMs) {
+    animation = null;
+    render();
+    return;
+  }
+  render();
+  requestAnimationFrame(tick);
+}
+
+function animatedPosition() {
+  if (!animation) return null;
+  const elapsed = performance.now() - animation.started;
+  const idx = Math.min(
+    animation.path.length - 1,
+    Math.floor(elapsed / STEP_MS),
+  );
+  const t = (elapsed - idx * STEP_MS) / STEP_MS;
+  const a = animation.path[idx];
+  const b = animation.path[Math.min(animation.path.length - 1, idx + 1)];
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
 }
 
 function serializeView(v) {
@@ -208,6 +251,7 @@ function updateHud() {
   }
   const isMyTurn = state.you && state.currentTurn === state.you && !state.winner;
   els.endTurn.disabled = !isMyTurn;
+  els.surrender.disabled = !state.you || state.winner || state.turnNumber < 4;
   els.reset.disabled = !ws || ws.readyState !== 1;
 }
 
@@ -215,23 +259,28 @@ function labelPlayer(p) {
   return p === "p1" ? "Player 1" : p === "p2" ? "Player 2" : p;
 }
 
-function unitAt(x, y) {
-  return state.units.find((u) => u.pos[0] === x && u.pos[1] === y);
+function unitAt(x, y) { return state.units.find((u) => u.pos[0] === x && u.pos[1] === y); }
+function buildingAt(x, y) {
+  return (state.buildings || []).find((b) => b.pos[0] === x && b.pos[1] === y);
 }
 
-function enemiesAdjacentTo([x, y]) {
-  if (!state.you) return new Set();
+function adjacentEnemies([x, y]) {
   const out = new Set();
+  if (!state.you) return out;
   for (const u of state.units) {
     if (u.owner === state.you) continue;
     const d = Math.abs(u.pos[0] - x) + Math.abs(u.pos[1] - y);
-    if (d >= 1 && d <= 1) out.add(`${u.pos[0]},${u.pos[1]}`);
+    if (d === 1) out.add(`${u.pos[0]},${u.pos[1]}`);
+  }
+  for (const b of state.buildings || []) {
+    if (b.owner === state.you) continue;
+    if (!b.currentlyVisible) continue; // can't attack what you can't see
+    const d = Math.abs(b.pos[0] - x) + Math.abs(b.pos[1] - y);
+    if (d === 1) out.add(`${b.pos[0]},${b.pos[1]}`);
   }
   return out;
 }
 
-// Find a reachable tile from which `unit` can attack `enemyPos` (melee Manhattan-1).
-// Prefers staying put if already adjacent; otherwise the cheapest reachable adjacent.
 function findAttackPosition(unit, enemyPos) {
   const r = reachable || computeReachable(unit);
   const cur = `${unit.pos[0]},${unit.pos[1]}`;
@@ -250,17 +299,21 @@ function findAttackPosition(unit, enemyPos) {
   return null;
 }
 
-// Enemies the selected unit could hit this turn from any reachable tile.
 function attackableEnemiesForSelected() {
   if (!selected || !reachable) return new Set();
   const out = new Set();
-  for (const u of state.units) {
-    if (u.owner === state.you) continue;
+  const candidates = [
+    ...state.units.filter((u) => u.owner !== state.you).map((u) => ({ pos: u.pos })),
+    ...(state.buildings || [])
+      .filter((b) => b.owner !== state.you && b.currentlyVisible)
+      .map((b) => ({ pos: b.pos })),
+  ];
+  for (const c of candidates) {
     for (const k of reachable) {
       const [rx, ry] = k.split(",").map(Number);
-      const d = Math.abs(rx - u.pos[0]) + Math.abs(ry - u.pos[1]);
+      const d = Math.abs(rx - c.pos[0]) + Math.abs(ry - c.pos[1]);
       if (d === 1) {
-        out.add(`${u.pos[0]},${u.pos[1]}`);
+        out.add(`${c.pos[0]},${c.pos[1]}`);
         break;
       }
     }
@@ -270,14 +323,17 @@ function attackableEnemiesForSelected() {
 
 function computeReachable(unit) {
   const map = state.map;
-  const mp = 3; // infantry move points
+  const mp = 3;
   const cost = { plains: 1, forest: 1, mountain: 2, sea: null };
-  const enemySet = new Set();
+  const blocked = new Set();
   const friendSet = new Set();
   for (const u of state.units) {
     const k = `${u.pos[0]},${u.pos[1]}`;
-    if (u.owner !== unit.owner) enemySet.add(k);
+    if (u.owner !== unit.owner) blocked.add(k);
     else if (u.id !== unit.id) friendSet.add(k);
+  }
+  for (const b of state.buildings || []) {
+    blocked.add(`${b.pos[0]},${b.pos[1]}`);
   }
   const best = new Map();
   best.set(`${unit.pos[0]},${unit.pos[1]}`, 0);
@@ -291,7 +347,7 @@ function computeReachable(unit) {
       const t = map.tiles[ny * map.width + nx];
       const step = cost[t];
       if (step == null) continue;
-      if (enemySet.has(`${nx},${ny}`)) continue;
+      if (blocked.has(`${nx},${ny}`)) continue;
       const nc = c + step;
       if (nc > mp) continue;
       const key = `${nx},${ny}`;
@@ -330,7 +386,6 @@ function render() {
     }
   }
 
-  // Reachable highlight (only when no pending move).
   if (reachable && !pendingMove) {
     ctx.fillStyle = "rgba(255, 230, 120, 0.28)";
     for (const k of reachable) {
@@ -339,7 +394,6 @@ function render() {
     }
   }
 
-  // Pending move tile.
   if (pendingMove) {
     const [x, y] = pendingMove;
     ctx.fillStyle = "rgba(255, 230, 120, 0.45)";
@@ -349,8 +403,6 @@ function render() {
     ctx.strokeRect(x * TILE + 1, y * TILE + 1, TILE - 2, TILE - 2);
   }
 
-  // Attack target rings: explicit attackTargets in attack-pick mode, OR
-  // pre-show all attackable enemies whenever a unit is selected.
   const targetsToRing = attackTargets ?? attackableEnemiesForSelected();
   if (targetsToRing.size > 0) {
     ctx.strokeStyle = "#ff5050";
@@ -359,14 +411,28 @@ function render() {
       const [x, y] = k.split(",").map(Number);
       const cx = x * TILE + TILE / 2;
       const cy = y * TILE + TILE / 2;
+      ctx.strokeRect(x * TILE + 4, y * TILE + 4, TILE - 8, TILE - 8);
       ctx.beginPath();
       ctx.arc(cx, cy, TILE * 0.42, 0, Math.PI * 2);
       ctx.stroke();
     }
   }
 
-  // Units.
-  for (const u of state.units) drawUnit(u, u.id === selected?.id);
+  // Currently-visible buildings (full opacity).
+  for (const b of state.buildings || []) {
+    if (!b.currentlyVisible) continue;
+    drawBuilding(b, false);
+  }
+
+  // Units (with optional animation override for the moving unit).
+  const animPos = animatedPosition();
+  for (const u of state.units) {
+    let renderPos = u.pos;
+    if (animation && u.id === animation.unitId && animPos) {
+      renderPos = animPos;
+    }
+    drawUnit(u, renderPos, u.id === selected?.id);
+  }
 
   // Fog overlay (player view only).
   if (state.you) {
@@ -379,12 +445,78 @@ function render() {
       }
     }
   }
+
+  // Ghost buildings on top of fog so the player still sees what they remember.
+  for (const b of state.buildings || []) {
+    if (b.currentlyVisible) continue;
+    drawBuilding(b, true);
+  }
 }
 
-function drawUnit(u, isSelected) {
-  const [x, y] = u.pos;
-  const cx = x * TILE + TILE / 2;
-  const cy = y * TILE + TILE / 2;
+function drawBuilding(b, ghost) {
+  const [x, y] = b.pos;
+  const px = x * TILE + 6;
+  const py = y * TILE + 6;
+  const size = TILE - 12;
+
+  ctx.save();
+  if (ghost) ctx.globalAlpha = 0.5;
+  // Body.
+  ctx.fillStyle = PLAYER_COLORS[b.owner] || "#aaa";
+  roundedRect(px, py, size, size, 4);
+  ctx.fill();
+  // Border.
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = ghost ? "#fff7" : "#fff";
+  ctx.setLineDash(ghost ? [4, 3] : []);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // Crest: a star.
+  drawStar(x * TILE + TILE / 2, y * TILE + TILE / 2 - 2, 5, TILE * 0.18, TILE * 0.08);
+
+  // HP text bottom-right.
+  const max = 10;
+  ctx.fillStyle = "#000a";
+  ctx.fillRect(x * TILE + TILE - 18, y * TILE + TILE - 14, 16, 12);
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 10px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(`${b.hp}/${max}`, x * TILE + TILE - 10, y * TILE + TILE - 8);
+  ctx.restore();
+}
+
+function drawStar(cx, cy, points, outer, inner) {
+  ctx.beginPath();
+  for (let i = 0; i < points * 2; i++) {
+    const r = i % 2 === 0 ? outer : inner;
+    const a = (Math.PI / points) * i - Math.PI / 2;
+    const px = cx + Math.cos(a) * r;
+    const py = cy + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.fillStyle = "#fff";
+  ctx.fill();
+}
+
+function roundedRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function drawUnit(u, pos, isSelected) {
+  const cx = pos[0] * TILE + TILE / 2;
+  const cy = pos[1] * TILE + TILE / 2;
   const r = TILE * 0.32;
 
   ctx.beginPath();

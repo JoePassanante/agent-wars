@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::game::{Coord, PlayerView, View};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ClientMsg {
     /// First message — pick a vantage.
@@ -18,12 +18,15 @@ pub enum ClientMsg {
     },
     /// End your turn.
     EndTurn,
+    /// Concede the match. Only allowed after at least 3 full turns have
+    /// elapsed (turn_number >= 4) so a player can't bail out instantly.
+    Surrender,
     /// Reset the lobby — wipe game state and start a fresh match.
     /// Allowed from any connected client (player or spectator).
     Reset,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ServerMsg {
     Joined { view: View },

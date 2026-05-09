@@ -1,7 +1,4 @@
-mod game;
-mod proto;
-mod ws;
-
+use agent_wars::ws;
 use axum::{Router, routing::get};
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;

@@ -97,6 +97,13 @@ impl UnitKind {
             (UnitKind::Infantry, UnitKind::Infantry) => Some(55),
         }
     }
+    /// Base damage % against a building. Lower than vs units to reflect that infantry
+    /// is poking at fortifications rather than punching through armor.
+    pub fn base_damage_vs_building(self, target: BuildingKind) -> u32 {
+        match (self, target) {
+            (UnitKind::Infantry, BuildingKind::Hq) => 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +116,28 @@ pub struct Unit {
     pub hp: u32,
     #[serde(default)]
     pub has_moved: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildingKind {
+    Hq,
+}
+
+impl BuildingKind {
+    pub fn max_hp(self) -> u32 {
+        10
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Building {
+    pub id: Uuid,
+    pub kind: BuildingKind,
+    pub owner: PlayerId,
+    pub pos: Coord,
+    pub hp: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,12 +206,42 @@ pub fn demo_map() -> Map {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GameState {
     pub map: Map,
     pub units: HashMap<Uuid, Unit>,
+    pub buildings: HashMap<Uuid, Building>,
     pub current_turn: PlayerId,
     pub turn_number: u32,
     pub winner: Option<PlayerId>,
+    /// What just happened — populated by try_action and cleared on the next action.
+    pub last_action: Option<ActionReport>,
+    /// Per-player memory of buildings the player has seen at least once.
+    /// Each entry is a snapshot of the building taken the last time the player
+    /// could see its tile (so HP/owner reflect the last sighting, not the
+    /// current truth — that's the "ghost" behavior).
+    #[serde(skip)]
+    pub seen_buildings: HashMap<PlayerId, HashMap<Uuid, SeenBuilding>>,
+    /// Players who started the match with an HQ. Used by the HQ-loss win rule
+    /// so test setups without buildings don't immediately decide a winner.
+    #[serde(skip)]
+    pub hq_owners: HashSet<PlayerId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeenBuilding {
+    pub building: Building,
+    pub last_seen_turn: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RememberedBuilding {
+    #[serde(flatten)]
+    pub building: Building,
+    pub currently_visible: bool,
+    pub last_seen_turn: u32,
 }
 
 impl GameState {
@@ -211,13 +270,35 @@ impl GameState {
                 },
             );
         }
+        let mut buildings = HashMap::new();
+        for (owner, pos) in [(PlayerId::P1, (3, 1)), (PlayerId::P2, (8, 8))] {
+            let id = Uuid::new_v4();
+            buildings.insert(
+                id,
+                Building {
+                    id,
+                    kind: BuildingKind::Hq,
+                    owner,
+                    pos,
+                    hp: BuildingKind::Hq.max_hp(),
+                },
+            );
+        }
         Self {
             map,
             units,
+            buildings,
             current_turn: PlayerId::P1,
             turn_number: 1,
             winner: None,
+            last_action: None,
+            seen_buildings: HashMap::new(),
+            hq_owners: [PlayerId::P1, PlayerId::P2].into_iter().collect(),
         }
+    }
+
+    pub fn building_at(&self, c: Coord) -> Option<&Building> {
+        self.buildings.values().find(|b| b.pos == c)
     }
 
     pub fn unit_at(&self, c: Coord) -> Option<&Unit> {
@@ -257,6 +338,10 @@ impl GameState {
                         continue;
                     }
                 }
+                // Buildings block movement entirely — units can't pass through or stop on them.
+                if self.building_at(n).is_some() {
+                    continue;
+                }
                 let new_cost = cost + step;
                 if new_cost > mp {
                     continue;
@@ -268,12 +353,80 @@ impl GameState {
             }
         }
 
-        // Filter out tiles occupied by other units (can't stop there) but keep origin.
-        best.retain(|&pos, _| pos == unit.pos || self.unit_at(pos).is_none());
+        // Filter out tiles occupied by other units or any building (can't stop there).
+        // The origin tile is always retained.
+        best.retain(|&pos, _| {
+            pos == unit.pos
+                || (self.unit_at(pos).is_none() && self.building_at(pos).is_none())
+        });
         best
     }
 
-    /// Move a unit and optionally attack an adjacent enemy.
+    /// Reconstruct the cheapest path the unit would walk to `dest` using the
+    /// same constraints as `reachable`. Returns the path including start and
+    /// end positions, or `None` if `dest` isn't actually reachable.
+    pub fn compute_path(&self, unit_id: Uuid, dest: Coord) -> Option<Vec<Coord>> {
+        let unit = self.units.get(&unit_id)?;
+        let mp = unit.kind.move_points();
+        let start = unit.pos;
+        if dest == start {
+            return Some(vec![start]);
+        }
+
+        let mut best: HashMap<Coord, u32> = HashMap::new();
+        let mut parent: HashMap<Coord, Coord> = HashMap::new();
+        best.insert(start, 0);
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, Coord)>> = BinaryHeap::new();
+        heap.push(std::cmp::Reverse((0, start)));
+
+        while let Some(std::cmp::Reverse((cost, pos))) = heap.pop() {
+            if cost > *best.get(&pos).unwrap_or(&u32::MAX) {
+                continue;
+            }
+            for n in neighbors4(pos) {
+                let Some(terrain) = self.map.terrain(n) else {
+                    continue;
+                };
+                let Some(step) = terrain.infantry_move_cost() else {
+                    continue;
+                };
+                if let Some(other) = self.unit_at(n) {
+                    if other.owner != unit.owner {
+                        continue;
+                    }
+                }
+                if self.building_at(n).is_some() {
+                    continue;
+                }
+                let new_cost = cost + step;
+                if new_cost > mp {
+                    continue;
+                }
+                if new_cost < *best.get(&n).unwrap_or(&u32::MAX) {
+                    best.insert(n, new_cost);
+                    parent.insert(n, pos);
+                    heap.push(std::cmp::Reverse((new_cost, n)));
+                }
+            }
+        }
+
+        if !best.contains_key(&dest) {
+            return None;
+        }
+        let mut path = vec![dest];
+        let mut cur = dest;
+        while let Some(&p) = parent.get(&cur) {
+            path.push(p);
+            cur = p;
+            if cur == start {
+                break;
+            }
+        }
+        path.reverse();
+        Some(path)
+    }
+
+    /// Move a unit and optionally attack a target (enemy unit OR enemy building).
     /// Pass `dest == current pos` for a stationary attack. Pass `attack = None` to just move.
     pub fn try_action(
         &mut self,
@@ -288,7 +441,11 @@ impl GameState {
         if actor != self.current_turn {
             return Err("not your turn".into());
         }
-        let unit = self.units.get(&unit_id).ok_or("unit not found")?;
+        let unit = self
+            .units
+            .get(&unit_id)
+            .ok_or("unit not found")?
+            .clone();
         if unit.owner != actor {
             return Err("not your unit".into());
         }
@@ -302,97 +459,162 @@ impl GameState {
         if dest != unit.pos && self.unit_at(dest).is_some() {
             return Err("destination occupied".into());
         }
+        if dest != unit.pos && self.building_at(dest).is_some() {
+            return Err("destination blocked by a building".into());
+        }
 
-        // Resolve attack target before mutating, so we can validate range and ownership.
-        let attack_outcome = if let Some(target_pos) = attack {
-            let target = self
-                .unit_at(target_pos)
-                .ok_or("no unit at attack target")?
-                .clone();
-            if target.owner == actor {
-                return Err("cannot attack your own unit".into());
+        // Validate attack target.
+        let (min_r, max_r) = unit.kind.attack_range();
+        let attack_target = match attack {
+            None => None,
+            Some(target_pos) => {
+                let manhattan = (dest.0 - target_pos.0).abs() + (dest.1 - target_pos.1).abs();
+                if manhattan < min_r || manhattan > max_r {
+                    return Err("target out of range".into());
+                }
+                if let Some(target_unit) = self.unit_at(target_pos) {
+                    if target_unit.owner == actor {
+                        return Err("cannot attack your own unit".into());
+                    }
+                    Some(AttackTarget::Unit(target_unit.id))
+                } else if let Some(target_bld) = self.building_at(target_pos) {
+                    if target_bld.owner == actor {
+                        return Err("cannot attack your own building".into());
+                    }
+                    Some(AttackTarget::Building(target_bld.id))
+                } else {
+                    return Err("no target at attack coord".into());
+                }
             }
-            let manhattan = (dest.0 - target_pos.0).abs() + (dest.1 - target_pos.1).abs();
-            let (min_r, max_r) = unit.kind.attack_range();
-            if manhattan < min_r || manhattan > max_r {
-                return Err("target out of range".into());
-            }
-            Some((target.id, target_pos))
-        } else {
-            None
         };
 
+        // Compute the path before mutating, so we can include it in the report
+        // (used by the browser client to animate the unit walking).
+        let path = self
+            .compute_path(unit_id, dest)
+            .unwrap_or_else(|| vec![unit.pos, dest]);
+
         // Apply move.
-        let unit = self.units.get_mut(&unit_id).unwrap();
-        unit.pos = dest;
-        unit.has_moved = true;
-        let attacker_kind = unit.kind;
-        let attacker_owner = unit.owner;
+        {
+            let unit_mut = self.units.get_mut(&unit_id).unwrap();
+            unit_mut.pos = dest;
+            unit_mut.has_moved = true;
+        }
 
         let mut report = ActionReport {
             unit_id,
             moved_to: dest,
+            path,
+            target_id: None,
+            target_kind: None,
             damage_to_defender: None,
             damage_to_attacker: None,
             defender_killed: false,
             attacker_killed: false,
-            target_id: None,
         };
 
-        if let Some((target_id, target_pos)) = attack_outcome {
-            // Read attacker snapshot.
-            let attacker = self.units.get(&unit_id).unwrap().clone();
-            let defender_terrain = self.map.terrain(target_pos).unwrap_or(Terrain::Plains);
-            let dmg = compute_damage(&attacker, defender_terrain, &self.units[&target_id]);
-            report.target_id = Some(target_id);
-            report.damage_to_defender = Some(dmg);
-
-            // Apply to defender.
-            let defender = self.units.get_mut(&target_id).unwrap();
-            defender.hp = defender.hp.saturating_sub(dmg);
-            let defender_dead = defender.hp == 0;
-            report.defender_killed = defender_dead;
-
-            if defender_dead {
-                self.units.remove(&target_id);
-            } else {
-                // Counterattack: defender hits back if still in range from where they stand.
+        match attack_target {
+            None => {}
+            Some(AttackTarget::Unit(target_id)) => {
+                let attacker = self.units[&unit_id].clone();
                 let defender = self.units[&target_id].clone();
-                let (min_r, max_r) = defender.kind.attack_range();
-                let manhattan = (defender.pos.0 - dest.0).abs() + (defender.pos.1 - dest.1).abs();
-                if manhattan >= min_r && manhattan <= max_r {
-                    let attacker_terrain = self.map.terrain(dest).unwrap_or(Terrain::Plains);
-                    let counter =
-                        compute_damage(&defender, attacker_terrain, &self.units[&unit_id]);
-                    report.damage_to_attacker = Some(counter);
-                    let attacker_mut = self.units.get_mut(&unit_id).unwrap();
-                    attacker_mut.hp = attacker_mut.hp.saturating_sub(counter);
-                    if attacker_mut.hp == 0 {
-                        self.units.remove(&unit_id);
-                        report.attacker_killed = true;
+                let defender_terrain =
+                    self.map.terrain(defender.pos).unwrap_or(Terrain::Plains);
+                let dmg = compute_damage(&attacker, defender_terrain, &defender);
+                report.target_id = Some(target_id);
+                report.target_kind = Some(TargetKind::Unit);
+                report.damage_to_defender = Some(dmg);
+
+                let def_mut = self.units.get_mut(&target_id).unwrap();
+                def_mut.hp = def_mut.hp.saturating_sub(dmg);
+                let dead = def_mut.hp == 0;
+                report.defender_killed = dead;
+
+                if dead {
+                    self.units.remove(&target_id);
+                } else {
+                    let defender = self.units[&target_id].clone();
+                    let (dmin, dmax) = defender.kind.attack_range();
+                    let m = (defender.pos.0 - dest.0).abs() + (defender.pos.1 - dest.1).abs();
+                    if m >= dmin && m <= dmax {
+                        let attacker_terrain =
+                            self.map.terrain(dest).unwrap_or(Terrain::Plains);
+                        let counter = compute_damage(
+                            &defender,
+                            attacker_terrain,
+                            &self.units[&unit_id],
+                        );
+                        report.damage_to_attacker = Some(counter);
+                        let atk = self.units.get_mut(&unit_id).unwrap();
+                        atk.hp = atk.hp.saturating_sub(counter);
+                        if atk.hp == 0 {
+                            self.units.remove(&unit_id);
+                            report.attacker_killed = true;
+                        }
                     }
                 }
             }
-
-            // Silence unused-binding warnings if matchup table grows.
-            let _ = (attacker_kind, attacker_owner);
+            Some(AttackTarget::Building(target_id)) => {
+                let attacker = self.units[&unit_id].clone();
+                let bld = self.buildings[&target_id].clone();
+                let bld_terrain = self.map.terrain(bld.pos).unwrap_or(Terrain::Plains);
+                let dmg = compute_damage_vs_building(&attacker, bld_terrain, &bld);
+                report.target_id = Some(target_id);
+                report.target_kind = Some(TargetKind::Building);
+                report.damage_to_defender = Some(dmg);
+                let bld_mut = self.buildings.get_mut(&target_id).unwrap();
+                bld_mut.hp = bld_mut.hp.saturating_sub(dmg);
+                if bld_mut.hp == 0 {
+                    report.defender_killed = true;
+                    self.buildings.remove(&target_id);
+                }
+            }
         }
 
-        // Rout check: a side with no remaining units loses.
-        let p1_alive = self.units.values().any(|u| u.owner == PlayerId::P1);
-        let p2_alive = self.units.values().any(|u| u.owner == PlayerId::P2);
-        if !p1_alive && !p2_alive {
-            // Tie shouldn't really happen in MVP, but call it for the current player.
+        // Win check: each player loses if they have no units (rout) OR their
+        // HQ has been destroyed (only applies if they started with one).
+        let p1_routed = !self.units.values().any(|u| u.owner == PlayerId::P1);
+        let p2_routed = !self.units.values().any(|u| u.owner == PlayerId::P2);
+        let p1_lost_hq = self.hq_owners.contains(&PlayerId::P1)
+            && !self
+                .buildings
+                .values()
+                .any(|b| b.owner == PlayerId::P1 && b.kind == BuildingKind::Hq);
+        let p2_lost_hq = self.hq_owners.contains(&PlayerId::P2)
+            && !self
+                .buildings
+                .values()
+                .any(|b| b.owner == PlayerId::P2 && b.kind == BuildingKind::Hq);
+        let p1_lost = p1_routed || p1_lost_hq;
+        let p2_lost = p2_routed || p2_lost_hq;
+        if p1_lost && p2_lost {
             self.winner = Some(self.current_turn);
-        } else if !p1_alive {
+        } else if p1_lost {
             self.winner = Some(PlayerId::P2);
-        } else if !p2_alive {
+        } else if p2_lost {
             self.winner = Some(PlayerId::P1);
         }
 
+        self.last_action = Some(report.clone());
         Ok(report)
     }
 
+
+    /// Concede the match. Only allowed after 3 complete turn cycles
+    /// (turn_number >= 4) so neither side can rage-quit immediately.
+    pub fn try_surrender(&mut self, actor: PlayerId) -> Result<(), String> {
+        if self.winner.is_some() {
+            return Err("game is already over".into());
+        }
+        if self.turn_number < 4 {
+            return Err(format!(
+                "surrender not allowed until turn 4 (currently turn {})",
+                self.turn_number
+            ));
+        }
+        self.winner = Some(actor.other());
+        Ok(())
+    }
 
     pub fn end_turn(&mut self, actor: PlayerId) -> Result<(), String> {
         if actor != self.current_turn {
@@ -407,6 +629,7 @@ impl GameState {
                 u.has_moved = false;
             }
         }
+        self.last_action = None;
         Ok(())
     }
 
@@ -437,6 +660,31 @@ fn neighbors4((x, y): Coord) -> [Coord; 4] {
     [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
 }
 
+/// What kind of thing an attack is targeting; resolved at validation time.
+enum AttackTarget {
+    Unit(Uuid),
+    Building(Uuid),
+}
+
+/// Damage formula against buildings. Same shape as unit-vs-unit but uses
+/// `base_damage_vs_building` and the building's HP for terrain reduction
+/// scaling.
+pub fn compute_damage_vs_building(
+    attacker: &Unit,
+    target_terrain: Terrain,
+    target: &Building,
+) -> u32 {
+    let base = attacker.kind.base_damage_vs_building(target.kind) as f32;
+    let max_hp = UnitKind::max_hp(attacker.kind) as f32;
+    let atk_hp_ratio = attacker.hp as f32 / max_hp;
+    let raw = base * atk_hp_ratio / 10.0;
+    let def_stars = target_terrain.defense() as f32;
+    let def_hp_ratio = target.hp as f32 / target.kind.max_hp() as f32;
+    let reduction = (def_stars * 0.1 * def_hp_ratio).clamp(0.0, 0.9);
+    let final_dmg = raw * (1.0 - reduction);
+    final_dmg.round().max(0.0) as u32
+}
+
 /// Compute damage in HP points an attacker deals to a defender on the given terrain.
 /// Simplified Advance Wars formula: scaled base damage × attacker HP, reduced by
 /// defender terrain stars × defender HP ratio.
@@ -455,16 +703,27 @@ pub fn compute_damage(attacker: &Unit, defender_terrain: Terrain, defender: &Uni
     final_dmg.round().max(0.0) as u32
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionReport {
     pub unit_id: Uuid,
     pub moved_to: Coord,
+    /// Tile-by-tile path the unit took, including start and end positions.
+    pub path: Vec<Coord>,
     pub target_id: Option<Uuid>,
+    /// "unit" or "building" — only present when target_id is set.
+    pub target_kind: Option<TargetKind>,
     pub damage_to_defender: Option<u32>,
     pub damage_to_attacker: Option<u32>,
     pub defender_killed: bool,
     pub attacker_killed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetKind {
+    Unit,
+    Building,
 }
 
 /// View of the world from a particular vantage point.
@@ -476,36 +735,85 @@ pub enum View {
     Spectator,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerView {
     pub map: Map,
     pub units: Vec<Unit>,
+    pub buildings: Vec<RememberedBuilding>,
     pub visible_tiles: Vec<Coord>,
     pub current_turn: PlayerId,
     pub turn_number: u32,
     pub winner: Option<PlayerId>,
     pub you: Option<PlayerId>,
+    #[serde(default)]
+    pub last_action: Option<ActionReport>,
 }
 
 impl GameState {
-    /// Produce a fog-filtered view for the given vantage.
-    pub fn view_for(&self, view: View) -> PlayerView {
+    /// Produce a fog-filtered view for the given vantage. Mutates per-player
+    /// "seen buildings" memory as a side effect so the player learns about
+    /// buildings that fall within their current vision.
+    pub fn view_for(&mut self, view: View) -> PlayerView {
         match view {
-            View::Spectator => PlayerView {
-                map: self.map.clone(),
-                units: self.units.values().cloned().collect(),
-                visible_tiles: (0..self.map.height)
-                    .flat_map(|y| (0..self.map.width).map(move |x| (x, y)))
-                    .collect(),
-                current_turn: self.current_turn,
-                turn_number: self.turn_number,
-                winner: self.winner,
-                you: None,
-            },
+            View::Spectator => {
+                let buildings: Vec<RememberedBuilding> = self
+                    .buildings
+                    .values()
+                    .map(|b| RememberedBuilding {
+                        building: b.clone(),
+                        currently_visible: true,
+                        last_seen_turn: self.turn_number,
+                    })
+                    .collect();
+                PlayerView {
+                    map: self.map.clone(),
+                    units: self.units.values().cloned().collect(),
+                    buildings,
+                    visible_tiles: (0..self.map.height)
+                        .flat_map(|y| (0..self.map.width).map(move |x| (x, y)))
+                        .collect(),
+                    current_turn: self.current_turn,
+                    turn_number: self.turn_number,
+                    winner: self.winner,
+                    you: None,
+                    last_action: self.last_action.clone(),
+                }
+            }
             View::Player(p) => {
                 let visible = self.visible_tiles(p);
-                // Adjacency check for forest hiding.
+
+                // Update seen-buildings memory for this player: every building
+                // whose tile is currently visible gets refreshed in the snapshot.
+                {
+                    let memory = self.seen_buildings.entry(p).or_default();
+                    for b in self.buildings.values() {
+                        if visible.contains(&b.pos) {
+                            memory.insert(
+                                b.id,
+                                SeenBuilding {
+                                    building: b.clone(),
+                                    last_seen_turn: self.turn_number,
+                                },
+                            );
+                        }
+                    }
+                }
+
+                let memory = self.seen_buildings.get(&p).cloned().unwrap_or_default();
+                let buildings: Vec<RememberedBuilding> = memory
+                    .into_values()
+                    .map(|s| {
+                        let still_present = self.buildings.contains_key(&s.building.id);
+                        let visible_now = still_present && visible.contains(&s.building.pos);
+                        RememberedBuilding {
+                            building: s.building,
+                            currently_visible: visible_now,
+                            last_seen_turn: s.last_seen_turn,
+                        }
+                    })
+                    .collect();
+
                 let visible_units: Vec<Unit> = self
                     .units
                     .values()
@@ -520,7 +828,6 @@ impl GameState {
                         if !terrain.hides_units() {
                             return true;
                         }
-                        // Hidden in forest unless we have a unit adjacent.
                         self.units.values().any(|own| {
                             own.owner == p
                                 && (own.pos.0 - u.pos.0).abs() <= 1
@@ -529,14 +836,17 @@ impl GameState {
                     })
                     .cloned()
                     .collect();
+
                 PlayerView {
                     map: self.map.clone(),
                     units: visible_units,
+                    buildings,
                     visible_tiles: visible.into_iter().collect(),
                     current_turn: self.current_turn,
                     turn_number: self.turn_number,
                     winner: self.winner,
                     you: Some(p),
+                    last_action: self.last_action.clone(),
                 }
             }
         }
@@ -566,10 +876,37 @@ mod tests {
         GameState {
             map,
             units: hm,
+            buildings: HashMap::new(),
             current_turn: PlayerId::P1,
             turn_number: 1,
             winner: None,
+            last_action: None,
+            seen_buildings: HashMap::new(),
+            hq_owners: HashSet::new(),
         }
+    }
+
+    fn place_with_buildings(
+        map: Map,
+        units: Vec<(PlayerId, Coord, u32)>,
+        buildings: Vec<(PlayerId, Coord, u32)>,
+    ) -> GameState {
+        let mut g = place(map, units);
+        for (owner, pos, hp) in buildings {
+            let id = Uuid::new_v4();
+            g.buildings.insert(
+                id,
+                Building {
+                    id,
+                    kind: BuildingKind::Hq,
+                    owner,
+                    pos,
+                    hp,
+                },
+            );
+            g.hq_owners.insert(owner);
+        }
+        g
     }
 
     fn flat_map(w: i32, h: i32) -> Map {
@@ -695,6 +1032,116 @@ mod tests {
             .try_action(PlayerId::P1, id, (2, 0), None)
             .unwrap_err();
         assert!(err.contains("already"), "got: {err}");
+    }
+
+    #[test]
+    fn building_blocks_movement() {
+        let g = place_with_buildings(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10)],
+            vec![(PlayerId::P2, (1, 0), 10)],
+        );
+        let id = id_of(&g, PlayerId::P1, (0, 0));
+        let r = g.reachable(id);
+        // Can't stop on the building tile, and the building blocks pass-through
+        // so (2,0) shouldn't be reached via that row.
+        assert!(!r.contains_key(&(1, 0)));
+        assert!(!r.contains_key(&(2, 0)));
+        // But going down the column is fine.
+        assert!(r.contains_key(&(0, 1)));
+    }
+
+    #[test]
+    fn attacking_enemy_hq_damages_it() {
+        let mut g = place_with_buildings(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (1, 0), 10), (PlayerId::P2, (4, 4), 10)],
+            vec![(PlayerId::P2, (2, 0), 10), (PlayerId::P1, (4, 0), 10)],
+        );
+        let atk = id_of(&g, PlayerId::P1, (1, 0));
+        let p2_hq = g
+            .buildings
+            .values()
+            .find(|b| b.owner == PlayerId::P2)
+            .unwrap()
+            .id;
+        let r = g
+            .try_action(PlayerId::P1, atk, (1, 0), Some((2, 0)))
+            .unwrap();
+        // base 30, atk_hp=10 -> raw 3.0; reduction 1*1.0*0.1=0.1 -> 2.7 -> 3
+        assert_eq!(r.damage_to_defender, Some(3));
+        assert_eq!(r.target_kind, Some(TargetKind::Building));
+        assert_eq!(r.damage_to_attacker, None);
+        assert_eq!(g.buildings[&p2_hq].hp, 7);
+        assert!(g.winner.is_none());
+    }
+
+    #[test]
+    fn destroying_hq_wins_even_with_units_alive() {
+        let mut g = place_with_buildings(
+            flat_map(5, 5),
+            vec![
+                (PlayerId::P1, (1, 0), 10),
+                (PlayerId::P2, (4, 4), 10), // P2 still has a unit
+            ],
+            vec![(PlayerId::P2, (2, 0), 1), (PlayerId::P1, (4, 0), 10)],
+        );
+        let atk = id_of(&g, PlayerId::P1, (1, 0));
+        let r = g
+            .try_action(PlayerId::P1, atk, (1, 0), Some((2, 0)))
+            .unwrap();
+        assert!(r.defender_killed);
+        assert_eq!(g.winner, Some(PlayerId::P1));
+    }
+
+    #[test]
+    fn cannot_attack_own_hq() {
+        let mut g = place_with_buildings(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (1, 0), 10)],
+            vec![(PlayerId::P1, (2, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        let atk = id_of(&g, PlayerId::P1, (1, 0));
+        let err = g
+            .try_action(PlayerId::P1, atk, (1, 0), Some((2, 0)))
+            .unwrap_err();
+        assert!(err.contains("own building"), "got: {err}");
+    }
+
+    #[test]
+    fn action_report_includes_path() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        let id = id_of(&g, PlayerId::P1, (0, 0));
+        let r = g.try_action(PlayerId::P1, id, (3, 0), None).unwrap();
+        // 3 steps east on plains: path includes start and each tile to dest.
+        assert_eq!(r.path.first(), Some(&(0, 0)));
+        assert_eq!(r.path.last(), Some(&(3, 0)));
+        assert_eq!(r.path.len(), 4);
+    }
+
+    #[test]
+    fn surrender_blocked_before_turn_4() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        let err = g.try_surrender(PlayerId::P1).unwrap_err();
+        assert!(err.contains("turn 4"), "got: {err}");
+        assert!(g.winner.is_none());
+    }
+
+    #[test]
+    fn surrender_allowed_at_turn_4_other_wins() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        g.turn_number = 4;
+        g.try_surrender(PlayerId::P2).unwrap();
+        assert_eq!(g.winner, Some(PlayerId::P1));
     }
 
     #[test]
