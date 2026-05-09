@@ -96,7 +96,7 @@ impl PlayerId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum UnitKind {
     Infantry,
     Scout,
