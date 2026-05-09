@@ -97,30 +97,37 @@ impl UnitKind {
             UnitKind::HeavyInfantry => (1, 1),
         }
     }
-    /// Cost to produce at a factory.
+    /// Cost to produce at a factory. Scouts are cheap recon (cheap & fragile),
+    /// infantry are the mid-tier all-rounder, heavy infantry is premium armor.
     pub fn cost(self) -> u32 {
         match self {
-            UnitKind::Infantry => 1000,
-            UnitKind::Scout => 3000,
-            UnitKind::HeavyInfantry => 2500,
+            UnitKind::Scout => 1000,
+            UnitKind::Infantry => 2000,
+            UnitKind::HeavyInfantry => 3000,
         }
     }
     /// All current unit kinds are infantry-class and can capture buildings.
     pub fn can_capture(self) -> bool {
         true
     }
-    /// Base damage % out of 100 against a given defender (Advance Wars-style table).
+    /// Base damage % out of 100 against a given defender. Tuned so each kind
+    /// has a clear role:
+    /// - Scouts are recon: hit infantry hard, useless against heavy armor,
+    ///   take heavy damage from anything except other scouts.
+    /// - Heavy infantry is the brick: shrugs off infantry/scout chip damage,
+    ///   trades evenly with other heavies.
+    /// - Infantry is the all-rounder: average damage in and out vs everything.
     pub fn base_damage(self, target: UnitKind) -> Option<u32> {
         use UnitKind::*;
         Some(match (self, target) {
             (Infantry,      Infantry)      => 55,
-            (Infantry,      Scout)         => 60,
-            (Infantry,      HeavyInfantry) => 45,
+            (Infantry,      Scout)         => 70,
+            (Infantry,      HeavyInfantry) => 35,
             (Scout,         Infantry)      => 70,
-            (Scout,         Scout)         => 35,
-            (Scout,         HeavyInfantry) => 55,
+            (Scout,         Scout)         => 45,
+            (Scout,         HeavyInfantry) => 20,
             (HeavyInfantry, Infantry)      => 65,
-            (HeavyInfantry, Scout)         => 85,
+            (HeavyInfantry, Scout)         => 95,
             (HeavyInfantry, HeavyInfantry) => 55,
         })
     }
@@ -314,24 +321,24 @@ impl GameState {
     pub fn new() -> Self {
         let map = demo_map();
         let mut units = HashMap::new();
+        // Each player starts with one scout and one infantry. Lean opening —
+        // you'll need to capture cities and produce more units to push.
         let starts = [
-            (PlayerId::P1, (2, 2)),
-            (PlayerId::P1, (3, 2)),
-            (PlayerId::P1, (4, 2)),
-            (PlayerId::P2, (7, 7)),
-            (PlayerId::P2, (8, 7)),
-            (PlayerId::P2, (9, 7)),
+            (PlayerId::P1, UnitKind::Scout, (3, 2)),
+            (PlayerId::P1, UnitKind::Infantry, (4, 2)),
+            (PlayerId::P2, UnitKind::Scout, (8, 7)),
+            (PlayerId::P2, UnitKind::Infantry, (7, 7)),
         ];
-        for (owner, pos) in starts {
+        for (owner, kind, pos) in starts {
             let id = Uuid::new_v4();
             units.insert(
                 id,
                 Unit {
                     id,
-                    kind: UnitKind::Infantry,
+                    kind,
                     owner,
                     pos,
-                    hp: UnitKind::Infantry.max_hp(),
+                    hp: kind.max_hp(),
                     has_moved: false,
                 },
             );
@@ -1434,7 +1441,7 @@ mod tests {
         let new_unit = g
             .try_buy_unit(PlayerId::P1, factory, UnitKind::HeavyInfantry)
             .unwrap();
-        assert_eq!(g.funds[&PlayerId::P1], 4000 - 2500);
+        assert_eq!(g.funds[&PlayerId::P1], 4000 - UnitKind::HeavyInfantry.cost());
         assert_eq!(g.units[&new_unit].pos, (2, 2));
         assert!(g.units[&new_unit].has_moved); // can't act this turn
         // Second buy on same factory should fail.
@@ -1470,6 +1477,81 @@ mod tests {
             .try_buy_unit(PlayerId::P1, factory, UnitKind::Infantry)
             .unwrap_err();
         assert!(err.contains("insufficient funds"), "got: {err}");
+    }
+
+    #[test]
+    fn unit_role_identity_holds() {
+        // Scout is fragile vs heavy and barely scratches it.
+        let mut g = place(flat_map(5, 5), vec![]);
+        let scout_id = Uuid::new_v4();
+        let heavy_id = Uuid::new_v4();
+        g.units.insert(
+            scout_id,
+            Unit {
+                id: scout_id,
+                kind: UnitKind::Scout,
+                owner: PlayerId::P1,
+                pos: (1, 0),
+                hp: 10,
+                has_moved: false,
+            },
+        );
+        g.units.insert(
+            heavy_id,
+            Unit {
+                id: heavy_id,
+                kind: UnitKind::HeavyInfantry,
+                owner: PlayerId::P2,
+                pos: (2, 0),
+                hp: 10,
+                has_moved: false,
+            },
+        );
+        let r = g
+            .try_action(PlayerId::P1, scout_id, (1, 0), Some((2, 0)))
+            .unwrap();
+        // Scout vs heavy: 20 base * 1.0 / 10 * 0.9 (plains) = 1.8 -> 2
+        assert_eq!(r.damage_to_defender, Some(2));
+        // Heavy at 8 HP counters: 95 * 0.8 / 10 * 0.9 = 6.84 -> 7
+        assert_eq!(r.damage_to_attacker, Some(7));
+        assert_eq!(g.units[&scout_id].hp, 3);
+        assert_eq!(g.units[&heavy_id].hp, 8);
+    }
+
+    #[test]
+    fn heavy_shrugs_off_infantry_chip() {
+        let mut g = place(flat_map(5, 5), vec![]);
+        let inf = Uuid::new_v4();
+        let heavy = Uuid::new_v4();
+        g.units.insert(
+            inf,
+            Unit {
+                id: inf,
+                kind: UnitKind::Infantry,
+                owner: PlayerId::P1,
+                pos: (1, 0),
+                hp: 10,
+                has_moved: false,
+            },
+        );
+        g.units.insert(
+            heavy,
+            Unit {
+                id: heavy,
+                kind: UnitKind::HeavyInfantry,
+                owner: PlayerId::P2,
+                pos: (2, 0),
+                hp: 10,
+                has_moved: false,
+            },
+        );
+        let r = g
+            .try_action(PlayerId::P1, inf, (1, 0), Some((2, 0)))
+            .unwrap();
+        // Inf vs heavy: 35 * 1.0 / 10 * 0.9 = 3.15 -> 3
+        assert_eq!(r.damage_to_defender, Some(3));
+        // Heavy at 7 HP counters: 65 * 0.7 / 10 * 0.9 = 4.095 -> 4
+        assert_eq!(r.damage_to_attacker, Some(4));
     }
 
     #[test]

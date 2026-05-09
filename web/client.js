@@ -15,7 +15,7 @@ const TERRAIN_COLORS = {
 const PLAYER_COLORS = { p1: "#dd4455", p2: "#3388cc" };
 const NEUTRAL_COLOR = "#888";
 
-const UNIT_COSTS = { infantry: 1000, scout: 3000, heavy_infantry: 2500 };
+const UNIT_COSTS = { scout: 1000, infantry: 2000, heavy_infantry: 3000 };
 const UNIT_KIND_LABELS = {
   infantry: "Infantry",
   scout: "Scout",
