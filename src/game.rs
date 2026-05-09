@@ -770,101 +770,108 @@ impl GameState {
     /// Produce a fog-filtered view for the given vantage. Mutates per-player
     /// "seen buildings" memory as a side effect so the player learns about
     /// buildings that fall within their current vision.
+    ///
+    /// When the match is over (`winner.is_some()`), fog is lifted for both
+    /// players — both sides need to be able to see what actually happened so
+    /// agents that just lost their last unit don't conclude "tie" from
+    /// missing information.
     pub fn view_for(&mut self, view: View) -> PlayerView {
-        match view {
-            View::Spectator => {
-                let buildings: Vec<RememberedBuilding> = self
-                    .buildings
-                    .values()
-                    .map(|b| RememberedBuilding {
-                        building: b.clone(),
-                        currently_visible: true,
-                        last_seen_turn: self.turn_number,
-                    })
-                    .collect();
-                PlayerView {
-                    map: self.map.clone(),
-                    units: self.units.values().cloned().collect(),
-                    buildings,
-                    visible_tiles: (0..self.map.height)
-                        .flat_map(|y| (0..self.map.width).map(move |x| (x, y)))
-                        .collect(),
-                    current_turn: self.current_turn,
-                    turn_number: self.turn_number,
-                    winner: self.winner,
-                    you: None,
-                    last_action: self.last_action.clone(),
-                }
-            }
-            View::Player(p) => {
-                let visible = self.visible_tiles(p);
+        let game_over = self.winner.is_some();
+        let me = match view {
+            View::Spectator => None,
+            View::Player(p) => Some(p),
+        };
+        let reveal_all = game_over || me.is_none();
 
-                // Update seen-buildings memory for this player: every building
-                // whose tile is currently visible gets refreshed in the snapshot.
-                {
-                    let memory = self.seen_buildings.entry(p).or_default();
-                    for b in self.buildings.values() {
-                        if visible.contains(&b.pos) {
-                            memory.insert(
-                                b.id,
-                                SeenBuilding {
-                                    building: b.clone(),
-                                    last_seen_turn: self.turn_number,
-                                },
-                            );
-                        }
+        let visible: HashSet<Coord> = if reveal_all {
+            (0..self.map.height)
+                .flat_map(|y| (0..self.map.width).map(move |x| (x, y)))
+                .collect()
+        } else {
+            self.visible_tiles(me.unwrap())
+        };
+
+        // Refresh per-player seen-buildings memory while the match is live.
+        if let Some(p) = me {
+            if !game_over {
+                let memory = self.seen_buildings.entry(p).or_default();
+                for b in self.buildings.values() {
+                    if visible.contains(&b.pos) {
+                        memory.insert(
+                            b.id,
+                            SeenBuilding {
+                                building: b.clone(),
+                                last_seen_turn: self.turn_number,
+                            },
+                        );
                     }
                 }
-
-                let memory = self.seen_buildings.get(&p).cloned().unwrap_or_default();
-                let buildings: Vec<RememberedBuilding> = memory
-                    .into_values()
-                    .map(|s| {
-                        let still_present = self.buildings.contains_key(&s.building.id);
-                        let visible_now = still_present && visible.contains(&s.building.pos);
-                        RememberedBuilding {
-                            building: s.building,
-                            currently_visible: visible_now,
-                            last_seen_turn: s.last_seen_turn,
-                        }
-                    })
-                    .collect();
-
-                let visible_units: Vec<Unit> = self
-                    .units
-                    .values()
-                    .filter(|u| {
-                        if u.owner == p {
-                            return true;
-                        }
-                        if !visible.contains(&u.pos) {
-                            return false;
-                        }
-                        let terrain = self.map.terrain(u.pos).unwrap_or(Terrain::Plains);
-                        if !terrain.hides_units() {
-                            return true;
-                        }
-                        self.units.values().any(|own| {
-                            own.owner == p
-                                && (own.pos.0 - u.pos.0).abs() <= 1
-                                && (own.pos.1 - u.pos.1).abs() <= 1
-                        })
-                    })
-                    .cloned()
-                    .collect();
-
-                PlayerView {
-                    map: self.map.clone(),
-                    units: visible_units,
-                    buildings,
-                    visible_tiles: visible.into_iter().collect(),
-                    current_turn: self.current_turn,
-                    turn_number: self.turn_number,
-                    winner: self.winner,
-                    you: Some(p),
-                    last_action: self.last_action.clone(),
-                }
             }
+        }
+
+        let visible_units: Vec<Unit> = if reveal_all {
+            self.units.values().cloned().collect()
+        } else {
+            let p = me.unwrap();
+            self.units
+                .values()
+                .filter(|u| {
+                    if u.owner == p {
+                        return true;
+                    }
+                    if !visible.contains(&u.pos) {
+                        return false;
+                    }
+                    let terrain = self.map.terrain(u.pos).unwrap_or(Terrain::Plains);
+                    if !terrain.hides_units() {
+                        return true;
+                    }
+                    self.units.values().any(|own| {
+                        own.owner == p
+                            && (own.pos.0 - u.pos.0).abs() <= 1
+                            && (own.pos.1 - u.pos.1).abs() <= 1
+                    })
+                })
+                .cloned()
+                .collect()
+        };
+
+        let buildings: Vec<RememberedBuilding> = if reveal_all {
+            self.buildings
+                .values()
+                .map(|b| RememberedBuilding {
+                    building: b.clone(),
+                    currently_visible: true,
+                    last_seen_turn: self.turn_number,
+                })
+                .collect()
+        } else {
+            let p = me.unwrap();
+            let memory = self.seen_buildings.get(&p).cloned().unwrap_or_default();
+            memory
+                .into_values()
+                .map(|s| {
+                    let still_present = self.buildings.contains_key(&s.building.id);
+                    let visible_now = still_present && visible.contains(&s.building.pos);
+                    RememberedBuilding {
+                        building: s.building,
+                        currently_visible: visible_now,
+                        last_seen_turn: s.last_seen_turn,
+                    }
+                })
+                .collect()
+        };
+
+        PlayerView {
+            map: self.map.clone(),
+            units: visible_units,
+            buildings,
+            visible_tiles: visible.into_iter().collect(),
+            current_turn: self.current_turn,
+            turn_number: self.turn_number,
+            winner: self.winner,
+            you: me,
+            last_action: self.last_action.clone(),
         }
     }
 }

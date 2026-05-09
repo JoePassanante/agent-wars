@@ -574,8 +574,9 @@ async fn handle_wait_for_turn(
     let snapshot = client.state.lock().await.clone();
     if let Some(view) = snapshot {
         if let Some(w) = view.winner {
+            let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
             return Ok(format!(
-                "Game is over. Winner: {:?}. (You: {:?}.)\n",
+                "Game is over. Winner: {:?} ({outcome}). (You: {:?}.)\n",
                 w, me
             ));
         }
@@ -606,8 +607,9 @@ async fn handle_wait_for_turn(
                 let view = client.state.lock().await.clone();
                 if let Some(v) = view {
                     if let Some(w) = v.winner {
+                        let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
                         return Ok(format!(
-                            "Game is over. Winner: {:?}. (You: {:?}.)\n",
+                            "Game is over. Winner: {:?} ({outcome}). (You: {:?}.)\n",
                             w, me
                         ));
                     }
@@ -735,7 +737,8 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         view.turn_number, view.current_turn, me
     ));
     if let Some(w) = view.winner {
-        s.push_str(&format!("GAME OVER — winner: {:?}.\n", w));
+        let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
+        s.push_str(&format!("GAME OVER — Winner: {:?} ({outcome}).\n", w));
     }
     s.push_str(&format!(
         "Map: {} x {}. Visible tiles: {}/{}.\n\n",
@@ -895,7 +898,7 @@ fn format_action_report(
     unit_id: Uuid,
     to: Coord,
     target: Option<Coord>,
-    _me: PlayerId,
+    me: PlayerId,
 ) -> String {
     let mut s = String::new();
 
@@ -966,7 +969,32 @@ fn format_action_report(
     }
 
     if let Some(w) = new.winner {
-        s.push_str(&format!("\nGAME OVER — winner: {:?}.\n", w));
+        let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
+        s.push_str(&format!("\nGAME OVER — Winner: {:?} ({outcome}).\n", w));
+        s.push_str(&summarize_final_state(new, me));
+    }
+    s
+}
+
+/// At end of game, print a clean rundown of who has what so the agent can
+/// understand the result instead of guessing from a fog-filtered last view.
+fn summarize_final_state(view: &PlayerView, me: PlayerId) -> String {
+    let mut s = String::from("Final state:\n");
+    for owner in [PlayerId::P1, PlayerId::P2] {
+        let units: Vec<&Unit> = view.units.iter().filter(|u| u.owner == owner).collect();
+        let bldgs: Vec<&agent_wars::game::RememberedBuilding> = view
+            .buildings
+            .iter()
+            .filter(|rb| rb.building.owner == owner)
+            .collect();
+        let label = if owner == me { "you" } else { "opponent" };
+        s.push_str(&format!(
+            "  {:?} ({}): units={}, buildings={}\n",
+            owner,
+            label,
+            units.len(),
+            bldgs.len(),
+        ));
     }
     s
 }
