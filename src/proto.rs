@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::game::{Coord, PlayerView, View};
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ClientMsg {
     /// First message — pick a vantage.
     Join { view: View },
@@ -15,7 +15,7 @@ pub enum ClientMsg {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ServerMsg {
     Joined { view: View },
     State(PlayerView),

@@ -8,15 +8,15 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
-use crate::game::{GameState, PlayerId, View};
+use crate::game::{GameState, View};
 use crate::proto::{ClientMsg, ServerMsg};
 
 #[derive(Clone)]
 pub struct AppState {
     pub game: Arc<Mutex<GameState>>,
-    /// Broadcast channel that pings every client when state changes.
+    /// Pings every connection when the game state changes.
     pub tx: broadcast::Sender<()>,
 }
 
@@ -35,8 +35,23 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
-    let (mut sender, mut receiver) = socket.split();
-    let mut rx = state.tx.subscribe();
+    let (mut ws_sink, mut receiver) = socket.split();
+
+    // Single writer task drains an mpsc into the socket; everything else
+    // produces ServerMsgs into this channel.
+    let (out_tx, mut out_rx) = mpsc::channel::<ServerMsg>(32);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = out_rx.recv().await {
+            let json = match serde_json::to_string(&msg) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if ws_sink.send(Message::Text(json)).await.is_err() {
+                break;
+            }
+        }
+        let _ = ws_sink.send(Message::Close(None)).await;
+    });
 
     // Wait for the Join message before doing anything else.
     let join_view = loop {
@@ -44,57 +59,66 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
                 Ok(ClientMsg::Join { view }) => break view,
                 Ok(_) => {
-                    let _ = send(&mut sender, &ServerMsg::Error {
-                        message: "join required first".into(),
-                    })
-                    .await;
+                    let _ = out_tx
+                        .send(ServerMsg::Error {
+                            message: "join required first".into(),
+                        })
+                        .await;
                 }
                 Err(e) => {
-                    let _ = send(&mut sender, &ServerMsg::Error {
-                        message: format!("bad message: {e}"),
-                    })
-                    .await;
+                    let _ = out_tx
+                        .send(ServerMsg::Error {
+                            message: format!("bad message: {e}"),
+                        })
+                        .await;
                 }
             },
-            Some(Ok(Message::Close(_))) | None => return,
-            Some(Ok(_)) => {} // ignore binary/ping/pong
-            Some(Err(_)) => return,
+            Some(Ok(Message::Close(_))) | None => {
+                drop(out_tx);
+                let _ = writer.await;
+                return;
+            }
+            Some(Ok(_)) => {}
+            Some(Err(_)) => {
+                drop(out_tx);
+                let _ = writer.await;
+                return;
+            }
         }
     };
 
-    if send(&mut sender, &ServerMsg::Joined { view: join_view })
+    if out_tx
+        .send(ServerMsg::Joined { view: join_view })
         .await
         .is_err()
     {
         return;
     }
 
-    // Push the initial state.
+    // Initial state push.
     {
         let g = state.game.lock().await;
         let view = g.view_for(join_view);
-        if send(&mut sender, &ServerMsg::State(view)).await.is_err() {
+        if out_tx.send(ServerMsg::State(view)).await.is_err() {
             return;
         }
     }
 
-    // Spawn a task that pushes filtered state to this client whenever the game changes.
-    let game = state.game.clone();
-    let push_view = join_view;
-    let mut sender = sender;
+    // Push task: re-send filtered state on every broadcast tick.
+    let mut rx = state.tx.subscribe();
+    let push_game = state.game.clone();
+    let push_tx = out_tx.clone();
     let push = tokio::spawn(async move {
         while rx.recv().await.is_ok() {
-            let g = game.lock().await;
-            let view = g.view_for(push_view);
-            if send(&mut sender, &ServerMsg::State(view)).await.is_err() {
+            let g = push_game.lock().await;
+            let view = g.view_for(join_view);
+            if push_tx.send(ServerMsg::State(view)).await.is_err() {
                 break;
             }
         }
-        // Try to close cleanly.
-        let _ = sender.send(Message::Close(None)).await;
     });
 
-    // Read loop: handle commands.
+    // Read loop.
     while let Some(msg) = receiver.next().await {
         let Ok(msg) = msg else { break };
         let text = match msg {
@@ -102,32 +126,28 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Message::Close(_) => break,
             _ => continue,
         };
-        let cmd = match serde_json::from_str::<ClientMsg>(&text) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = state.tx.send(()); // no-op nudge
-                tracing::debug!(error = %e, "bad client message");
-                continue;
+        match serde_json::from_str::<ClientMsg>(&text) {
+            Ok(cmd) => {
+                if let Err(message) = handle_command(&state, join_view, cmd).await {
+                    let _ = out_tx.send(ServerMsg::Error { message }).await;
+                }
             }
-        };
-        let result = handle_command(&state, join_view, cmd).await;
-        if let Err(message) = result {
-            tracing::debug!(error = %message, "command rejected");
-            // We can't push an error to *this* client through the broadcast channel,
-            // so we don't bother sending Error frames here for the MVP. The next State
-            // push reflects the unchanged game.
-            let _ = message;
+            Err(e) => {
+                let _ = out_tx
+                    .send(ServerMsg::Error {
+                        message: format!("bad message: {e}"),
+                    })
+                    .await;
+            }
         }
     }
 
     push.abort();
+    drop(out_tx);
+    let _ = writer.await;
 }
 
-async fn handle_command(
-    state: &AppState,
-    view: View,
-    cmd: ClientMsg,
-) -> Result<(), String> {
+async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<(), String> {
     let actor = match view {
         View::Spectator => return Err("spectators cannot act".into()),
         View::Player(p) => p,
@@ -148,18 +168,4 @@ async fn handle_command(
             Ok(())
         }
     }
-}
-
-async fn send<S>(sender: &mut S, msg: &ServerMsg) -> Result<(), ()>
-where
-    S: SinkExt<Message> + Unpin,
-{
-    let json = serde_json::to_string(msg).map_err(|_| ())?;
-    sender.send(Message::Text(json)).await.map_err(|_| ())
-}
-
-// Helper to silence dead-code warnings if PlayerId is only used through serde paths.
-#[allow(dead_code)]
-fn _player_id_keepalive(p: PlayerId) -> PlayerId {
-    p
 }
