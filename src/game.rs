@@ -128,6 +128,13 @@ impl BuildingKind {
     pub fn max_hp(self) -> u32 {
         10
     }
+    /// Buildings emit vision around themselves — short-range, but enough to
+    /// notice an enemy creeping up on the HQ.
+    pub fn vision(self) -> i32 {
+        match self {
+            BuildingKind::Hq => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -633,22 +640,31 @@ impl GameState {
         Ok(())
     }
 
-    /// Tiles visible to a player given their units' vision and terrain.
+    /// Tiles visible to a player given their units' and buildings' vision.
     pub fn visible_tiles(&self, player: PlayerId) -> HashSet<Coord> {
         let mut vis = HashSet::new();
         for u in self.units.values().filter(|u| u.owner == player) {
-            // A unit always sees its own tile.
             vis.insert(u.pos);
             let terrain = self.map.terrain(u.pos).unwrap_or(Terrain::Plains);
             let r = u.kind.vision() + terrain.vision_bonus();
             for dy in -r..=r {
                 for dx in -r..=r {
                     let c = (u.pos.0 + dx, u.pos.1 + dy);
-                    if !self.map.in_bounds(c) {
-                        continue;
+                    if self.map.in_bounds(c) {
+                        vis.insert(c);
                     }
-                    // Chebyshev distance check (already implicit), just bounds.
-                    vis.insert(c);
+                }
+            }
+        }
+        for b in self.buildings.values().filter(|b| b.owner == player) {
+            vis.insert(b.pos);
+            let r = b.kind.vision();
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    let c = (b.pos.0 + dx, b.pos.1 + dy);
+                    if self.map.in_bounds(c) {
+                        vis.insert(c);
+                    }
                 }
             }
         }
@@ -1120,6 +1136,32 @@ mod tests {
         assert_eq!(r.path.first(), Some(&(0, 0)));
         assert_eq!(r.path.last(), Some(&(3, 0)));
         assert_eq!(r.path.len(), 4);
+    }
+
+    #[test]
+    fn hq_provides_short_range_vision() {
+        // Build a state where P1's only assets are an HQ (no units), so the
+        // visible tiles must come from the building alone.
+        let mut g = place(flat_map(7, 7), vec![]);
+        let id = Uuid::new_v4();
+        g.buildings.insert(
+            id,
+            Building {
+                id,
+                kind: BuildingKind::Hq,
+                owner: PlayerId::P1,
+                pos: (3, 3),
+                hp: 10,
+            },
+        );
+        let vis = g.visible_tiles(PlayerId::P1);
+        // Vision = 1 around (3,3): a 3x3 square = 9 tiles.
+        assert_eq!(vis.len(), 9);
+        assert!(vis.contains(&(3, 3)));
+        assert!(vis.contains(&(2, 2)));
+        assert!(vis.contains(&(4, 4)));
+        // 2 tiles away should be fogged for an HQ-only player.
+        assert!(!vis.contains(&(5, 3)));
     }
 
     #[test]

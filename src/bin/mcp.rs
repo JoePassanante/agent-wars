@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_wars::game::{Coord, GameState, PlayerId, PlayerView, Terrain, Unit, UnitKind, View};
 use agent_wars::proto::{ClientMsg, ServerMsg};
@@ -330,6 +330,22 @@ fn list_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
+            "name": "wait_for_turn",
+            "description": "Block until it's your turn or the game ends, then return. If your turn doesn't arrive within `timeoutSeconds` (default 50), returns a 'still waiting' status so you can call again. Idle CPU — server pushes you the moment state changes. Use this between rounds instead of polling get_state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "timeoutSeconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "description": "Max seconds to block. Default 50."
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
             "name": "surrender",
             "description": "Concede the match — the other player wins immediately. The server rejects surrender until at least 3 full turns have elapsed (turn_number >= 4) so a player can't bail out instantly.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
@@ -353,6 +369,7 @@ async fn dispatch_tool(
         "attackable_targets" => handle_attackable(client, args).await,
         "act" => handle_act(client, args).await,
         "end_turn" => handle_end_turn(client).await,
+        "wait_for_turn" => handle_wait_for_turn(client, args).await,
         "surrender" => handle_surrender(client).await,
         "reset_lobby" => handle_reset(client).await,
         other => Err(format!("unknown tool: {other}")),
@@ -537,6 +554,75 @@ async fn handle_end_turn(client: &Arc<McpClient>) -> Result<String, String> {
             new.turn_number, new.current_turn
         )),
         _ => Err("unexpected server response".into()),
+    }
+}
+
+async fn handle_wait_for_turn(
+    client: &Arc<McpClient>,
+    args: &Value,
+) -> Result<String, String> {
+    let timeout_secs = args
+        .get("timeoutSeconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 120);
+    let me = client.player;
+
+    // Subscribe BEFORE the first state read so we never miss a transition.
+    let mut events = client.events.subscribe();
+
+    let snapshot = client.state.lock().await.clone();
+    if let Some(view) = snapshot {
+        if let Some(w) = view.winner {
+            return Ok(format!(
+                "Game is over. Winner: {:?}. (You: {:?}.)\n",
+                w, me
+            ));
+        }
+        if view.current_turn == me {
+            return Ok(format!(
+                "It's your turn now (turn {}). Call get_state for details.\n",
+                view.turn_number
+            ));
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            let view = client.state.lock().await.clone();
+            return Ok(match view {
+                Some(v) => format!(
+                    "Still {:?}'s turn (turn {}) after {}s. Call wait_for_turn again to keep waiting.\n",
+                    v.current_turn, v.turn_number, timeout_secs
+                ),
+                None => "No state yet — server may not be running.".into(),
+            });
+        }
+        match timeout(deadline - now, events.recv()).await {
+            Ok(Ok(_)) => {
+                // State changed — re-check.
+                let view = client.state.lock().await.clone();
+                if let Some(v) = view {
+                    if let Some(w) = v.winner {
+                        return Ok(format!(
+                            "Game is over. Winner: {:?}. (You: {:?}.)\n",
+                            w, me
+                        ));
+                    }
+                    if v.current_turn == me {
+                        return Ok(format!(
+                            "It's your turn now (turn {}). Call get_state for details.\n",
+                            v.turn_number
+                        ));
+                    }
+                }
+                // Otherwise keep waiting.
+            }
+            Ok(Err(_)) => return Err("event channel closed".into()),
+            Err(_) => {} // timeout iter — loop and check deadline
+        }
     }
 }
 
