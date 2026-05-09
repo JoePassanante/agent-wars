@@ -65,43 +65,73 @@ impl PlayerId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum UnitKind {
     Infantry,
+    Scout,
+    HeavyInfantry,
 }
 
 impl UnitKind {
     pub fn move_points(self) -> u32 {
         match self {
             UnitKind::Infantry => 3,
+            UnitKind::Scout => 7,
+            UnitKind::HeavyInfantry => 2,
         }
     }
     pub fn vision(self) -> i32 {
         match self {
             UnitKind::Infantry => 2,
+            UnitKind::Scout => 4,
+            UnitKind::HeavyInfantry => 2,
         }
     }
     pub fn max_hp(self) -> u32 {
         10
     }
-    /// Direct combat range in Manhattan tiles. (Indirect units come later.)
     pub fn attack_range(self) -> (i32, i32) {
         match self {
             UnitKind::Infantry => (1, 1),
+            UnitKind::Scout => (1, 1),
+            UnitKind::HeavyInfantry => (1, 1),
         }
     }
-    /// Base damage % out of 100 against a given defender. Drives Advance Wars-style
-    /// matchup tables. Returns None for impossible matchups.
+    /// Cost to produce at a factory.
+    pub fn cost(self) -> u32 {
+        match self {
+            UnitKind::Infantry => 1000,
+            UnitKind::Scout => 3000,
+            UnitKind::HeavyInfantry => 2500,
+        }
+    }
+    /// All current unit kinds are infantry-class and can capture buildings.
+    pub fn can_capture(self) -> bool {
+        true
+    }
+    /// Base damage % out of 100 against a given defender (Advance Wars-style table).
     pub fn base_damage(self, target: UnitKind) -> Option<u32> {
-        match (self, target) {
-            (UnitKind::Infantry, UnitKind::Infantry) => Some(55),
-        }
+        use UnitKind::*;
+        Some(match (self, target) {
+            (Infantry,      Infantry)      => 55,
+            (Infantry,      Scout)         => 60,
+            (Infantry,      HeavyInfantry) => 45,
+            (Scout,         Infantry)      => 70,
+            (Scout,         Scout)         => 35,
+            (Scout,         HeavyInfantry) => 55,
+            (HeavyInfantry, Infantry)      => 65,
+            (HeavyInfantry, Scout)         => 85,
+            (HeavyInfantry, HeavyInfantry) => 55,
+        })
     }
-    /// Base damage % against a building. Lower than vs units to reflect that infantry
-    /// is poking at fortifications rather than punching through armor.
+    /// Base damage % against a building. Only HQs take damage; factories
+    /// and cities are captured rather than destroyed.
     pub fn base_damage_vs_building(self, target: BuildingKind) -> u32 {
         match (self, target) {
-            (UnitKind::Infantry, BuildingKind::Hq) => 30,
+            (UnitKind::Infantry,      BuildingKind::Hq) => 30,
+            (UnitKind::Scout,         BuildingKind::Hq) => 20,
+            (UnitKind::HeavyInfantry, BuildingKind::Hq) => 40,
+            (_, BuildingKind::Factory) | (_, BuildingKind::City) => 0,
         }
     }
 }
@@ -122,17 +152,37 @@ pub struct Unit {
 #[serde(rename_all = "lowercase")]
 pub enum BuildingKind {
     Hq,
+    Factory,
+    City,
 }
 
 impl BuildingKind {
     pub fn max_hp(self) -> u32 {
         10
     }
-    /// Buildings emit vision around themselves — short-range, but enough to
-    /// notice an enemy creeping up on the HQ.
+    /// Buildings emit short-range vision so the owner notices nearby threats.
     pub fn vision(self) -> i32 {
+        1
+    }
+    /// HQs block movement; factories and cities are passable so units can stand
+    /// on them to capture or to spawn from a factory.
+    pub fn blocks_movement(self) -> bool {
+        matches!(self, BuildingKind::Hq)
+    }
+    /// Cities and factories can change ownership by infantry standing on them
+    /// at end of turn. HQs cannot be captured — they're destroyed by damage.
+    pub fn capturable(self) -> bool {
+        matches!(self, BuildingKind::Factory | BuildingKind::City)
+    }
+    pub fn produces_units(self) -> bool {
+        matches!(self, BuildingKind::Factory)
+    }
+    /// Funds generated each turn by an owned building.
+    pub fn income_per_turn(self) -> u32 {
         match self {
-            BuildingKind::Hq => 1,
+            BuildingKind::Hq => 1000,
+            BuildingKind::Factory => 1000,
+            BuildingKind::City => 1000,
         }
     }
 }
@@ -142,7 +192,10 @@ impl BuildingKind {
 pub struct Building {
     pub id: Uuid,
     pub kind: BuildingKind,
-    pub owner: PlayerId,
+    /// `None` for neutral buildings (cities at start of game). HQs are always
+    /// owned. Factories may start owned by a player or neutral depending on
+    /// the map.
+    pub owner: Option<PlayerId>,
     pub pos: Coord,
     pub hp: u32,
 }
@@ -233,6 +286,12 @@ pub struct GameState {
     /// so test setups without buildings don't immediately decide a winner.
     #[serde(skip)]
     pub hq_owners: HashSet<PlayerId>,
+    /// Cash on hand for each player. Spent on units at factories.
+    pub funds: HashMap<PlayerId, u32>,
+    /// Factories that have already produced a unit during the current turn.
+    /// Cleared at the start of every turn.
+    #[serde(skip)]
+    pub factories_used: HashSet<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,19 +337,33 @@ impl GameState {
             );
         }
         let mut buildings = HashMap::new();
-        for (owner, pos) in [(PlayerId::P1, (3, 1)), (PlayerId::P2, (8, 8))] {
+        let add = |kind: BuildingKind, owner: Option<PlayerId>, pos: Coord, map_ref: &mut HashMap<Uuid, Building>| {
             let id = Uuid::new_v4();
-            buildings.insert(
+            map_ref.insert(
                 id,
                 Building {
                     id,
-                    kind: BuildingKind::Hq,
+                    kind,
                     owner,
                     pos,
-                    hp: BuildingKind::Hq.max_hp(),
+                    hp: kind.max_hp(),
                 },
             );
+        };
+        add(BuildingKind::Hq, Some(PlayerId::P1), (3, 1), &mut buildings);
+        add(BuildingKind::Hq, Some(PlayerId::P2), (8, 8), &mut buildings);
+        add(BuildingKind::Factory, Some(PlayerId::P1), (4, 1), &mut buildings);
+        add(BuildingKind::Factory, Some(PlayerId::P2), (7, 8), &mut buildings);
+        // Four neutral cities scattered roughly symmetrically — race to
+        // capture them for income.
+        for pos in [(1, 4), (10, 5), (5, 3), (6, 6)] {
+            add(BuildingKind::City, None, pos, &mut buildings);
         }
+
+        let mut funds = HashMap::new();
+        funds.insert(PlayerId::P1, 4000);
+        funds.insert(PlayerId::P2, 4000);
+
         Self {
             map,
             units,
@@ -301,6 +374,8 @@ impl GameState {
             last_action: None,
             seen_buildings: HashMap::new(),
             hq_owners: [PlayerId::P1, PlayerId::P2].into_iter().collect(),
+            funds,
+            factories_used: HashSet::new(),
         }
     }
 
@@ -345,9 +420,11 @@ impl GameState {
                         continue;
                     }
                 }
-                // Buildings block movement entirely — units can't pass through or stop on them.
-                if self.building_at(n).is_some() {
-                    continue;
+                // HQs block movement; factories and cities are passable.
+                if let Some(b) = self.building_at(n) {
+                    if b.kind.blocks_movement() {
+                        continue;
+                    }
                 }
                 let new_cost = cost + step;
                 if new_cost > mp {
@@ -360,11 +437,15 @@ impl GameState {
             }
         }
 
-        // Filter out tiles occupied by other units or any building (can't stop there).
-        // The origin tile is always retained.
+        // Filter out tiles occupied by other units or by a movement-blocking
+        // building (HQ). Cities/factories are valid destinations because units
+        // can stand on them to capture or to spawn from.
         best.retain(|&pos, _| {
             pos == unit.pos
-                || (self.unit_at(pos).is_none() && self.building_at(pos).is_none())
+                || (self.unit_at(pos).is_none()
+                    && self
+                        .building_at(pos)
+                        .map_or(true, |b| !b.kind.blocks_movement()))
         });
         best
     }
@@ -402,8 +483,10 @@ impl GameState {
                         continue;
                     }
                 }
-                if self.building_at(n).is_some() {
-                    continue;
+                if let Some(b) = self.building_at(n) {
+                    if b.kind.blocks_movement() {
+                        continue;
+                    }
                 }
                 let new_cost = cost + step;
                 if new_cost > mp {
@@ -463,11 +546,11 @@ impl GameState {
         if !reachable.contains_key(&dest) {
             return Err("destination not reachable".into());
         }
+        // (Reachable already filtered impassable buildings and units; the
+        // remaining `dest != unit.pos && unit_at` check is just a defensive
+        // sanity in case state changed underneath us.)
         if dest != unit.pos && self.unit_at(dest).is_some() {
             return Err("destination occupied".into());
-        }
-        if dest != unit.pos && self.building_at(dest).is_some() {
-            return Err("destination blocked by a building".into());
         }
 
         // Validate attack target.
@@ -485,8 +568,13 @@ impl GameState {
                     }
                     Some(AttackTarget::Unit(target_unit.id))
                 } else if let Some(target_bld) = self.building_at(target_pos) {
-                    if target_bld.owner == actor {
+                    if target_bld.owner == Some(actor) {
                         return Err("cannot attack your own building".into());
+                    }
+                    if !matches!(target_bld.kind, BuildingKind::Hq) {
+                        return Err(
+                            "only HQs take damage; cities and factories are captured".into(),
+                        );
                     }
                     Some(AttackTarget::Building(target_bld.id))
                 } else {
@@ -586,12 +674,12 @@ impl GameState {
             && !self
                 .buildings
                 .values()
-                .any(|b| b.owner == PlayerId::P1 && b.kind == BuildingKind::Hq);
+                .any(|b| b.owner == Some(PlayerId::P1) && b.kind == BuildingKind::Hq);
         let p2_lost_hq = self.hq_owners.contains(&PlayerId::P2)
             && !self
                 .buildings
                 .values()
-                .any(|b| b.owner == PlayerId::P2 && b.kind == BuildingKind::Hq);
+                .any(|b| b.owner == Some(PlayerId::P2) && b.kind == BuildingKind::Hq);
         let p1_lost = p1_routed || p1_lost_hq;
         let p2_lost = p2_routed || p2_lost_hq;
         if p1_lost && p2_lost {
@@ -627,6 +715,12 @@ impl GameState {
         if actor != self.current_turn {
             return Err("not your turn".into());
         }
+
+        // Process captures: any of the actor's units sitting on a capturable
+        // building they don't own takes ownership instantly.
+        self.process_captures(actor);
+
+        // Hand the turn over.
         self.current_turn = actor.other();
         if self.current_turn == PlayerId::P1 {
             self.turn_number += 1;
@@ -636,8 +730,98 @@ impl GameState {
                 u.has_moved = false;
             }
         }
+
+        // Incoming player collects income from all owned buildings.
+        self.collect_income(self.current_turn);
+
+        // Factories can produce again on the new turn.
+        self.factories_used.clear();
+
         self.last_action = None;
         Ok(())
+    }
+
+    fn process_captures(&mut self, actor: PlayerId) {
+        let captures: Vec<Uuid> = self
+            .buildings
+            .values()
+            .filter(|b| b.kind.capturable() && b.owner != Some(actor))
+            .filter(|b| {
+                self.units
+                    .values()
+                    .any(|u| u.pos == b.pos && u.owner == actor && u.kind.can_capture())
+            })
+            .map(|b| b.id)
+            .collect();
+        for bid in captures {
+            if let Some(b) = self.buildings.get_mut(&bid) {
+                b.owner = Some(actor);
+            }
+        }
+    }
+
+    fn collect_income(&mut self, player: PlayerId) {
+        let income: u32 = self
+            .buildings
+            .values()
+            .filter(|b| b.owner == Some(player))
+            .map(|b| b.kind.income_per_turn())
+            .sum();
+        *self.funds.entry(player).or_default() += income;
+    }
+
+    /// Spend funds at one of your factories to spawn a unit on its tile.
+    /// Constraints: the factory must be yours, idle this turn, and have an
+    /// empty tile (no unit currently standing on it). The new unit is marked
+    /// has_moved=true so it can't act until next turn.
+    pub fn try_buy_unit(
+        &mut self,
+        actor: PlayerId,
+        factory_id: Uuid,
+        kind: UnitKind,
+    ) -> Result<Uuid, String> {
+        if self.winner.is_some() {
+            return Err("game is over".into());
+        }
+        if actor != self.current_turn {
+            return Err("not your turn".into());
+        }
+        let factory = self.buildings.get(&factory_id).ok_or("factory not found")?;
+        if !factory.kind.produces_units() {
+            return Err("that building does not produce units".into());
+        }
+        if factory.owner != Some(actor) {
+            return Err("not your factory".into());
+        }
+        if self.factories_used.contains(&factory_id) {
+            return Err("factory already produced this turn".into());
+        }
+        if self.unit_at(factory.pos).is_some() {
+            return Err("factory tile is occupied — move the unit off first".into());
+        }
+        let cost = kind.cost();
+        let funds = self.funds.get(&actor).copied().unwrap_or(0);
+        if funds < cost {
+            return Err(format!(
+                "insufficient funds: need {cost}, have {funds}"
+            ));
+        }
+
+        let pos = factory.pos;
+        *self.funds.entry(actor).or_default() -= cost;
+        self.factories_used.insert(factory_id);
+
+        let id = Uuid::new_v4();
+        let unit = Unit {
+            id,
+            kind,
+            owner: actor,
+            pos,
+            hp: kind.max_hp(),
+            has_moved: true,
+        };
+        self.units.insert(id, unit);
+        Ok(id)
     }
 
     /// Tiles visible to a player given their units' and buildings' vision.
@@ -656,7 +840,11 @@ impl GameState {
                 }
             }
         }
-        for b in self.buildings.values().filter(|b| b.owner == player) {
+        for b in self
+            .buildings
+            .values()
+            .filter(|b| b.owner == Some(player))
+        {
             vis.insert(b.pos);
             let r = b.kind.vision();
             for dy in -r..=r {
@@ -762,6 +950,12 @@ pub struct PlayerView {
     pub turn_number: u32,
     pub winner: Option<PlayerId>,
     pub you: Option<PlayerId>,
+    /// Funds visible to this viewer: just their own for players, all for
+    /// spectators (and at game over, both players' funds are revealed).
+    pub funds: HashMap<PlayerId, u32>,
+    /// Factories that have already produced this turn (so the client can
+    /// gray out their buy buttons).
+    pub factories_used: Vec<Uuid>,
     #[serde(default)]
     pub last_action: Option<ActionReport>,
 }
@@ -862,6 +1056,16 @@ impl GameState {
                 .collect()
         };
 
+        let funds: HashMap<PlayerId, u32> = if reveal_all {
+            self.funds.clone()
+        } else {
+            let mut h = HashMap::new();
+            if let Some(p) = me {
+                h.insert(p, self.funds.get(&p).copied().unwrap_or(0));
+            }
+            h
+        };
+
         PlayerView {
             map: self.map.clone(),
             units: visible_units,
@@ -871,6 +1075,8 @@ impl GameState {
             turn_number: self.turn_number,
             winner: self.winner,
             you: me,
+            funds,
+            factories_used: self.factories_used.iter().copied().collect(),
             last_action: self.last_action.clone(),
         }
     }
@@ -906,6 +1112,8 @@ mod tests {
             last_action: None,
             seen_buildings: HashMap::new(),
             hq_owners: HashSet::new(),
+            funds: HashMap::new(),
+            factories_used: HashSet::new(),
         }
     }
 
@@ -922,7 +1130,7 @@ mod tests {
                 Building {
                     id,
                     kind: BuildingKind::Hq,
-                    owner,
+                    owner: Some(owner),
                     pos,
                     hp,
                 },
@@ -930,6 +1138,26 @@ mod tests {
             g.hq_owners.insert(owner);
         }
         g
+    }
+
+    fn add_building(g: &mut GameState, kind: BuildingKind, owner: Option<PlayerId>, pos: Coord) -> Uuid {
+        let id = Uuid::new_v4();
+        g.buildings.insert(
+            id,
+            Building {
+                id,
+                kind,
+                owner,
+                pos,
+                hp: kind.max_hp(),
+            },
+        );
+        if matches!(kind, BuildingKind::Hq) {
+            if let Some(p) = owner {
+                g.hq_owners.insert(p);
+            }
+        }
+        id
     }
 
     fn flat_map(w: i32, h: i32) -> Map {
@@ -1085,7 +1313,7 @@ mod tests {
         let p2_hq = g
             .buildings
             .values()
-            .find(|b| b.owner == PlayerId::P2)
+            .find(|b| b.owner == Some(PlayerId::P2))
             .unwrap()
             .id;
         let r = g
@@ -1150,17 +1378,7 @@ mod tests {
         // Build a state where P1's only assets are an HQ (no units), so the
         // visible tiles must come from the building alone.
         let mut g = place(flat_map(7, 7), vec![]);
-        let id = Uuid::new_v4();
-        g.buildings.insert(
-            id,
-            Building {
-                id,
-                kind: BuildingKind::Hq,
-                owner: PlayerId::P1,
-                pos: (3, 3),
-                hp: 10,
-            },
-        );
+        add_building(&mut g, BuildingKind::Hq, Some(PlayerId::P1), (3, 3));
         let vis = g.visible_tiles(PlayerId::P1);
         // Vision = 1 around (3,3): a 3x3 square = 9 tiles.
         assert_eq!(vis.len(), 9);
@@ -1169,6 +1387,102 @@ mod tests {
         assert!(vis.contains(&(4, 4)));
         // 2 tiles away should be fogged for an HQ-only player.
         assert!(!vis.contains(&(5, 3)));
+    }
+
+    #[test]
+    fn city_passable_and_capturable() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        let city = add_building(&mut g, BuildingKind::City, None, (1, 0));
+        // City is reachable as a destination (passable, not blocked).
+        let id = id_of(&g, PlayerId::P1, (0, 0));
+        let r = g.reachable(id);
+        assert!(r.contains_key(&(1, 0)));
+        // Move onto the city.
+        g.try_action(PlayerId::P1, id, (1, 0), None).unwrap();
+        // End turn → P1 captures.
+        g.end_turn(PlayerId::P1).unwrap();
+        assert_eq!(g.buildings[&city].owner, Some(PlayerId::P1));
+    }
+
+    #[test]
+    fn city_income_collected_at_turn_start() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        g.funds.insert(PlayerId::P1, 0);
+        g.funds.insert(PlayerId::P2, 0);
+        add_building(&mut g, BuildingKind::City, Some(PlayerId::P2), (4, 0));
+        // P1 ends turn -> income tick happens for P2 (incoming player).
+        g.end_turn(PlayerId::P1).unwrap();
+        assert_eq!(g.funds.get(&PlayerId::P2).copied(), Some(1000));
+        assert_eq!(g.funds.get(&PlayerId::P1).copied(), Some(0));
+    }
+
+    #[test]
+    fn buy_unit_spawns_at_factory_and_deducts_funds() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        g.funds.insert(PlayerId::P1, 4000);
+        let factory = add_building(&mut g, BuildingKind::Factory, Some(PlayerId::P1), (2, 2));
+        let new_unit = g
+            .try_buy_unit(PlayerId::P1, factory, UnitKind::HeavyInfantry)
+            .unwrap();
+        assert_eq!(g.funds[&PlayerId::P1], 4000 - 2500);
+        assert_eq!(g.units[&new_unit].pos, (2, 2));
+        assert!(g.units[&new_unit].has_moved); // can't act this turn
+        // Second buy on same factory should fail.
+        let err = g
+            .try_buy_unit(PlayerId::P1, factory, UnitKind::Infantry)
+            .unwrap_err();
+        assert!(err.contains("already produced"), "got: {err}");
+    }
+
+    #[test]
+    fn buy_unit_blocked_when_tile_occupied() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (2, 2), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        g.funds.insert(PlayerId::P1, 4000);
+        let factory = add_building(&mut g, BuildingKind::Factory, Some(PlayerId::P1), (2, 2));
+        let err = g
+            .try_buy_unit(PlayerId::P1, factory, UnitKind::Infantry)
+            .unwrap_err();
+        assert!(err.contains("occupied"), "got: {err}");
+    }
+
+    #[test]
+    fn buy_unit_rejects_insufficient_funds() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        g.funds.insert(PlayerId::P1, 500);
+        let factory = add_building(&mut g, BuildingKind::Factory, Some(PlayerId::P1), (2, 2));
+        let err = g
+            .try_buy_unit(PlayerId::P1, factory, UnitKind::Infantry)
+            .unwrap_err();
+        assert!(err.contains("insufficient funds"), "got: {err}");
+    }
+
+    #[test]
+    fn cannot_attack_factory_or_city() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (1, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        add_building(&mut g, BuildingKind::Factory, Some(PlayerId::P2), (2, 0));
+        let atk = id_of(&g, PlayerId::P1, (1, 0));
+        let err = g
+            .try_action(PlayerId::P1, atk, (1, 0), Some((2, 0)))
+            .unwrap_err();
+        assert!(err.contains("captured"), "got: {err}");
     }
 
     #[test]

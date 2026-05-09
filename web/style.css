@@ -69,6 +69,7 @@ aside .hint { opacity: 0.65; line-height: 1.4; }
   height: 14px;
   border-radius: 3px;
   border: 1px solid #000a;
+  vertical-align: middle;
 }
 .swatch.plains   { background: #4f7a3a; }
 .swatch.forest   { background: #2d4a23; }
@@ -76,3 +77,44 @@ aside .hint { opacity: 0.65; line-height: 1.4; }
 .swatch.sea      { background: #1e4a78; }
 .swatch.p1       { background: #c34; border-radius: 50%; }
 .swatch.p2       { background: #38c; border-radius: 50%; }
+.bldg {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid #fff;
+  vertical-align: middle;
+}
+.bldg.hq      { background: #d24; border-radius: 0; }
+.bldg.factory { background: #c80; border-radius: 0; }
+.bldg.city    { background: #4a8; border-radius: 50%; }
+
+#buyPanel {
+  margin-bottom: 12px;
+  font-size: 12px;
+  background: #15171b;
+  border-radius: 4px;
+  padding: 8px;
+}
+#buyPanel .factory-row {
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #2a2d33;
+}
+#buyPanel .factory-row:last-child { border-bottom: none; padding-bottom: 0; }
+#buyPanel .factory-label {
+  display: block;
+  margin-bottom: 4px;
+  opacity: 0.8;
+}
+#buyPanel button {
+  background: #23262c;
+  color: #e6e6e6;
+  border: 1px solid #34383f;
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-size: 12px;
+  margin: 2px 4px 2px 0;
+  cursor: pointer;
+}
+#buyPanel button:hover:not(:disabled) { background: #2c3038; }
+#buyPanel button:disabled { opacity: 0.4; cursor: not-allowed; }

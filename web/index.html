@@ -26,27 +26,35 @@
       <div class="hud">
         <span>Turn <b id="turnNumber">–</b></span>
         <span>Active: <b id="currentTurn">–</b></span>
+        <span>Funds: <b id="funds">–</b></span>
         <span id="winner" class="winner"></span>
       </div>
     </header>
     <main>
       <canvas id="board" width="600" height="500"></canvas>
-      <aside id="legend">
+      <aside id="sidebar">
+        <h3>Buy at factory</h3>
+        <div id="buyPanel">
+          <p class="hint">Connect as a player to buy units.</p>
+        </div>
+
         <h3>Legend</h3>
         <ul>
           <li><span class="swatch plains"></span> Plains (def 1)</li>
-          <li><span class="swatch forest"></span> Forest (def 2, hides)</li>
+          <li><span class="swatch forest"></span> Forest (def 2, hides units)</li>
           <li><span class="swatch mountain"></span> Mountain (def 4, +vis)</li>
           <li><span class="swatch sea"></span> Sea (impassable)</li>
         </ul>
-        <h3>Units</h3>
+        <h3>Buildings</h3>
         <ul>
-          <li><span class="swatch p1"></span> Player 1 infantry</li>
-          <li><span class="swatch p2"></span> Player 2 infantry</li>
+          <li><span class="bldg hq"></span> HQ — destroyed at 0 HP, owner loses</li>
+          <li><span class="bldg factory"></span> Factory — buys 1 unit/turn</li>
+          <li><span class="bldg city"></span> City — captured, +1000g/turn</li>
         </ul>
         <p class="hint">
-          Click a friendly infantry to see reachable tiles, then click a
-          destination. End your turn when done.
+          Click your unit, then a destination or an attackable enemy. End
+          turn on a neutral/enemy city or factory to capture it. Click a
+          factory you own to buy units.
         </p>
       </aside>
     </main>

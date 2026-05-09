@@ -13,6 +13,14 @@ const TERRAIN_COLORS = {
   sea:      "#1e4a78",
 };
 const PLAYER_COLORS = { p1: "#dd4455", p2: "#3388cc" };
+const NEUTRAL_COLOR = "#888";
+
+const UNIT_COSTS = { infantry: 1000, scout: 3000, heavy_infantry: 2500 };
+const UNIT_KIND_LABELS = {
+  infantry: "Infantry",
+  scout: "Scout",
+  heavy_infantry: "Heavy Infantry",
+};
 
 const els = {
   role: document.getElementById("role"),
@@ -23,8 +31,10 @@ const els = {
   status: document.getElementById("status"),
   turnNumber: document.getElementById("turnNumber"),
   currentTurn: document.getElementById("currentTurn"),
+  funds: document.getElementById("funds"),
   winner: document.getElementById("winner"),
   canvas: document.getElementById("board"),
+  buyPanel: document.getElementById("buyPanel"),
 };
 const ctx = els.canvas.getContext("2d");
 
@@ -96,9 +106,10 @@ els.canvas.addEventListener("click", (e) => {
     const enemyTargetBuilding = buildingAt(x, y);
 
     // Click an enemy unit OR enemy HQ within reach -> auto-resolve.
+    // Cities and factories are captured by ending turn on them, not attacked.
     const enemyTarget =
       (enemyTargetUnit && enemyTargetUnit.owner !== me) ? enemyTargetUnit :
-      (enemyTargetBuilding && enemyTargetBuilding.owner !== me && enemyTargetBuilding.currentlyVisible) ? enemyTargetBuilding : null;
+      (enemyTargetBuilding && enemyTargetBuilding.kind === "hq" && enemyTargetBuilding.owner !== me && enemyTargetBuilding.currentlyVisible) ? enemyTargetBuilding : null;
     if (enemyTarget) {
       const standTile = findAttackPosition(selected, [x, y]);
       if (standTile) {
@@ -114,8 +125,11 @@ els.canvas.addEventListener("click", (e) => {
       render(); return;
     }
 
-    // Click a reachable empty tile -> move (or enter attack-pick).
-    if (reachable && reachable.has(`${x},${y}`) && !enemyTargetUnit && !enemyTargetBuilding) {
+    // Click a reachable destination tile -> move (or enter attack-pick).
+    // Factories/cities are passable destinations (you stand on them to capture
+    // or to spawn from); HQs block.
+    const dstBlocked = enemyTargetBuilding && enemyTargetBuilding.kind === "hq";
+    if (reachable && reachable.has(`${x},${y}`) && !enemyTargetUnit && !dstBlocked) {
       const targets = adjacentEnemies([x, y]);
       if (targets.size > 0) {
         pendingMove = [x, y];
@@ -242,8 +256,11 @@ function setStatus(text, cls = "") {
 function updateHud() {
   els.turnNumber.textContent = state.turnNumber;
   els.currentTurn.textContent = labelPlayer(state.currentTurn);
+  const myFunds = state.you ? (state.funds?.[state.you] ?? 0) : "—";
+  els.funds.textContent = myFunds === "—" ? "—" : `${myFunds}g`;
   if (state.winner) {
-    els.winner.textContent = `${labelPlayer(state.winner)} wins!`;
+    const outcome = state.you === state.winner ? "you win!" : state.you ? "you lose." : "match over.";
+    els.winner.textContent = `${labelPlayer(state.winner)} wins — ${outcome}`;
   } else if (lastError) {
     els.winner.textContent = `⚠ ${lastError}`;
   } else {
@@ -253,6 +270,54 @@ function updateHud() {
   els.endTurn.disabled = !isMyTurn;
   els.surrender.disabled = !state.you || state.winner || state.turnNumber < 4;
   els.reset.disabled = !ws || ws.readyState !== 1;
+  renderBuyPanel(isMyTurn);
+}
+
+function renderBuyPanel(isMyTurn) {
+  if (!state || !state.you) {
+    els.buyPanel.innerHTML = '<p class="hint">Connect as a player to buy units.</p>';
+    return;
+  }
+  const myFactories = (state.buildings || []).filter(
+    (rb) => rb.kind === "factory" && rb.owner === state.you,
+  );
+  if (myFactories.length === 0) {
+    els.buyPanel.innerHTML = '<p class="hint">You don\'t own any factories.</p>';
+    return;
+  }
+  const used = new Set(state.factoriesUsed || []);
+  const myFunds = state.funds?.[state.you] ?? 0;
+
+  const rows = myFactories.map((f) => {
+    const isUsed = used.has(f.id);
+    const occupied = (state.units || []).some(
+      (u) => u.pos[0] === f.pos[0] && u.pos[1] === f.pos[1],
+    );
+    let status = "";
+    if (!isMyTurn) status = " (not your turn)";
+    else if (isUsed) status = " (already produced)";
+    else if (occupied) status = " (tile occupied)";
+
+    const buttons = Object.entries(UNIT_COSTS)
+      .map(([kind, cost]) => {
+        const disabled = !isMyTurn || isUsed || occupied || myFunds < cost;
+        return `<button data-factory="${f.id}" data-kind="${kind}" ${disabled ? "disabled" : ""}>${UNIT_KIND_LABELS[kind]} (${cost}g)</button>`;
+      })
+      .join("");
+    return `<div class="factory-row"><span class="factory-label">Factory at [${f.pos[0]},${f.pos[1]}]${status}</span>${buttons}</div>`;
+  });
+  els.buyPanel.innerHTML = rows.join("");
+
+  // Bind buy buttons.
+  els.buyPanel.querySelectorAll("button[data-factory]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      send({
+        type: "buyUnit",
+        factoryId: btn.dataset.factory,
+        kind: btn.dataset.kind,
+      });
+    });
+  });
 }
 
 function labelPlayer(p) {
@@ -272,9 +337,11 @@ function adjacentEnemies([x, y]) {
     const d = Math.abs(u.pos[0] - x) + Math.abs(u.pos[1] - y);
     if (d === 1) out.add(`${u.pos[0]},${u.pos[1]}`);
   }
+  // Only enemy HQs are attackable; factories/cities are captured by standing on them.
   for (const b of state.buildings || []) {
+    if (b.kind !== "hq") continue;
     if (b.owner === state.you) continue;
-    if (!b.currentlyVisible) continue; // can't attack what you can't see
+    if (!b.currentlyVisible) continue;
     const d = Math.abs(b.pos[0] - x) + Math.abs(b.pos[1] - y);
     if (d === 1) out.add(`${b.pos[0]},${b.pos[1]}`);
   }
@@ -303,9 +370,11 @@ function attackableEnemiesForSelected() {
   if (!selected || !reachable) return new Set();
   const out = new Set();
   const candidates = [
-    ...state.units.filter((u) => u.owner !== state.you).map((u) => ({ pos: u.pos })),
+    ...state.units
+      .filter((u) => u.owner !== state.you)
+      .map((u) => ({ pos: u.pos })),
     ...(state.buildings || [])
-      .filter((b) => b.owner !== state.you && b.currentlyVisible)
+      .filter((b) => b.kind === "hq" && b.owner !== state.you && b.currentlyVisible)
       .map((b) => ({ pos: b.pos })),
   ];
   for (const c of candidates) {
@@ -332,8 +401,10 @@ function computeReachable(unit) {
     if (u.owner !== unit.owner) blocked.add(k);
     else if (u.id !== unit.id) friendSet.add(k);
   }
+  // Only HQs block movement; factories and cities are passable so units
+  // can stand on them to capture or to spawn from.
   for (const b of state.buildings || []) {
-    blocked.add(`${b.pos[0]},${b.pos[1]}`);
+    if (b.kind === "hq") blocked.add(`${b.pos[0]},${b.pos[1]}`);
   }
   const best = new Map();
   best.set(`${unit.pos[0]},${unit.pos[1]}`, 0);
@@ -455,35 +526,69 @@ function render() {
 
 function drawBuilding(b, ghost) {
   const [x, y] = b.pos;
+  const cx = x * TILE + TILE / 2;
+  const cy = y * TILE + TILE / 2;
   const px = x * TILE + 6;
   const py = y * TILE + 6;
   const size = TILE - 12;
 
+  const ownerColor = b.owner ? (PLAYER_COLORS[b.owner] || "#aaa") : NEUTRAL_COLOR;
+
   ctx.save();
   if (ghost) ctx.globalAlpha = 0.5;
-  // Body.
-  ctx.fillStyle = PLAYER_COLORS[b.owner] || "#aaa";
-  roundedRect(px, py, size, size, 4);
-  ctx.fill();
-  // Border.
+  ctx.fillStyle = ownerColor;
   ctx.lineWidth = 2;
   ctx.strokeStyle = ghost ? "#fff7" : "#fff";
   ctx.setLineDash(ghost ? [4, 3] : []);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  // Crest: a star.
-  drawStar(x * TILE + TILE / 2, y * TILE + TILE / 2 - 2, 5, TILE * 0.18, TILE * 0.08);
 
-  // HP text bottom-right.
-  const max = 10;
+  if (b.kind === "hq") {
+    roundedRect(px, py, size, size, 4);
+    ctx.fill();
+    ctx.stroke();
+    drawStar(cx, cy - 2, 5, TILE * 0.18, TILE * 0.08);
+    drawHpBadge(x, y, b.hp, 10);
+  } else if (b.kind === "factory") {
+    // Squat industrial silhouette: trapezoidal base + small chimney.
+    ctx.beginPath();
+    ctx.moveTo(px, py + size);
+    ctx.lineTo(px, py + size * 0.45);
+    ctx.lineTo(px + size * 0.6, py + size * 0.2);
+    ctx.lineTo(px + size, py + size * 0.45);
+    ctx.lineTo(px + size, py + size);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    // Chimney.
+    ctx.fillStyle = ownerColor;
+    ctx.fillRect(px + size * 0.65, py + size * 0.05, size * 0.15, size * 0.25);
+    ctx.strokeRect(px + size * 0.65, py + size * 0.05, size * 0.15, size * 0.25);
+  } else if (b.kind === "city") {
+    // Stack of small windows.
+    ctx.beginPath();
+    ctx.arc(cx, cy, size * 0.45, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    // Windows grid.
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#0a0a0a";
+    const w = size * 0.18;
+    for (const dy of [-w * 1.1, w * 0.1]) {
+      for (const dx of [-w * 0.7, w * 0.3]) {
+        ctx.fillRect(cx + dx, cy + dy, w * 0.5, w * 0.6);
+      }
+    }
+  }
+  ctx.restore();
+}
+
+function drawHpBadge(x, y, hp, max) {
   ctx.fillStyle = "#000a";
   ctx.fillRect(x * TILE + TILE - 18, y * TILE + TILE - 14, 16, 12);
   ctx.fillStyle = "#fff";
   ctx.font = "bold 10px monospace";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(`${b.hp}/${max}`, x * TILE + TILE - 10, y * TILE + TILE - 8);
-  ctx.restore();
+  ctx.fillText(`${hp}/${max}`, x * TILE + TILE - 10, y * TILE + TILE - 8);
 }
 
 function drawStar(cx, cy, points, outer, inner) {

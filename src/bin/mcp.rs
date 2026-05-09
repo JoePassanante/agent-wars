@@ -330,6 +330,21 @@ fn list_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
+            "name": "buy_unit",
+            "description": "Spend funds to spawn a unit at one of your factories. The factory must be yours, idle this turn, and have an empty tile (no unit standing on it). Newly produced units cannot act this turn. Costs: infantry=1000, scout=3000, heavy_infantry=2500.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "factoryId": { "type": "string" },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["infantry", "scout", "heavy_infantry"]
+                    }
+                },
+                "required": ["factoryId", "kind"]
+            }
+        }),
+        json!({
             "name": "wait_for_turn",
             "description": "Block until it's your turn or the game ends, then return. If your turn doesn't arrive within `timeoutSeconds` (default 50), returns a 'still waiting' status so you can call again. Idle CPU — server pushes you the moment state changes. Use this between rounds instead of polling get_state.",
             "inputSchema": {
@@ -368,6 +383,7 @@ async fn dispatch_tool(
         "legal_moves" => handle_legal_moves(client, args).await,
         "attackable_targets" => handle_attackable(client, args).await,
         "act" => handle_act(client, args).await,
+        "buy_unit" => handle_buy_unit(client, args).await,
         "end_turn" => handle_end_turn(client).await,
         "wait_for_turn" => handle_wait_for_turn(client, args).await,
         "surrender" => handle_surrender(client).await,
@@ -459,7 +475,7 @@ async fn handle_attackable(client: &Arc<McpClient>, args: &Value) -> Result<Stri
     }
     // Visible enemy buildings (ghost buildings excluded — can't attack what's behind fog).
     for rb in view.buildings.iter() {
-        if rb.building.owner == unit.owner {
+        if rb.building.owner == Some(unit.owner) {
             continue;
         }
         if !rb.currently_visible {
@@ -536,6 +552,50 @@ async fn handle_act(client: &Arc<McpClient>, args: &Value) -> Result<String, Str
             target,
             client.player,
         )),
+        _ => Err("unexpected server response".into()),
+    }
+}
+
+async fn handle_buy_unit(client: &Arc<McpClient>, args: &Value) -> Result<String, String> {
+    let factory_id_str = args
+        .get("factoryId")
+        .and_then(|v| v.as_str())
+        .ok_or("factoryId required")?;
+    let factory_id: Uuid = factory_id_str
+        .parse()
+        .map_err(|e: uuid::Error| format!("bad factoryId: {e}"))?;
+    let kind_str = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or("kind required")?;
+    let kind = parse_unit_kind(kind_str)?;
+
+    let prev_funds = client
+        .state
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|v| v.funds.get(&client.player).copied())
+        .unwrap_or(0);
+
+    let mut events = client.events.subscribe();
+    client
+        .cmd_tx
+        .send(ClientMsg::BuyUnit { factory_id, kind })
+        .await
+        .map_err(|_| "writer task dead".to_string())?;
+    match wait_for_response(&mut events).await? {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => {
+            let new_funds = new.funds.get(&client.player).copied().unwrap_or(0);
+            let spent = prev_funds.saturating_sub(new_funds);
+            Ok(format!(
+                "Bought {} for {}g. Funds remaining: {}g.\n",
+                unit_kind_name(kind),
+                spent,
+                new_funds
+            ))
+        }
         _ => Err("unexpected server response".into()),
     }
 }
@@ -709,6 +769,8 @@ fn synthetic_state(view: &PlayerView) -> GameState {
         last_action: view.last_action.clone(),
         seen_buildings: HashMap::new(),
         hq_owners: std::collections::HashSet::new(),
+        funds: HashMap::new(),
+        factories_used: std::collections::HashSet::new(),
     }
 }
 
@@ -724,7 +786,7 @@ fn terrain_name(t: Terrain) -> &'static str {
 fn terrain_glyph(t: Terrain) -> char {
     match t {
         Terrain::Plains => '.',
-        Terrain::Forest => 'F',
+        Terrain::Forest => '^',
         Terrain::Mountain => 'M',
         Terrain::Sea => '~',
     }
@@ -741,12 +803,16 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         s.push_str(&format!("GAME OVER — Winner: {:?} ({outcome}).\n", w));
     }
     s.push_str(&format!(
-        "Map: {} x {}. Visible tiles: {}/{}.\n\n",
+        "Map: {} x {}. Visible tiles: {}/{}.\n",
         view.map.width,
         view.map.height,
         view.visible_tiles.len(),
         view.map.width * view.map.height
     ));
+    if let Some(my_funds) = view.funds.get(&me).copied() {
+        s.push_str(&format!("Funds: {}g.\n", my_funds));
+    }
+    s.push('\n');
 
     // ASCII map.
     let mine_pos: HashMap<Coord, &Unit> = view
@@ -778,20 +844,21 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         s.push_str(&format!("{:>2} ", y));
         for x in 0..view.map.width {
             let pos = (x, y);
-            let glyph = if let Some(rb) = buildings_by_pos.get(&pos) {
-                // HQs are remembered through fog. Distinguish "live sighting" (uppercase)
-                // from "ghost / last known" (lowercase).
-                let live = rb.currently_visible;
-                let mine = rb.building.owner == me;
-                match (mine, live) {
-                    (true, _) => 'H', // your own HQ is always current
-                    (false, true) => 'X',
-                    (false, false) => 'x',
+            // Buildings render on top of units in the ASCII map. If a friendly
+            // unit happens to stand on a city/factory, we still draw the building
+            // glyph (lowercase) — agents can cross-reference the unit list.
+            let glyph = if let Some(u) = mine_pos.get(&pos) {
+                if buildings_by_pos.contains_key(&pos) {
+                    building_glyph(buildings_by_pos[&pos], me)
+                } else if u.has_moved {
+                    'u'
+                } else {
+                    'U'
                 }
+            } else if let Some(rb) = buildings_by_pos.get(&pos) {
+                building_glyph(rb, me)
             } else if !visible.contains(&pos) {
                 '?'
-            } else if let Some(u) = mine_pos.get(&pos) {
-                if u.has_moved { 'u' } else { 'U' }
             } else if theirs_pos.contains_key(&pos) {
                 'E'
             } else {
@@ -804,7 +871,13 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         }
         s.push('\n');
     }
-    s.push_str("\nLegend: U=your unit (can act), u=acted, E=enemy unit, H=your HQ, X=enemy HQ (visible), x=enemy HQ (last seen / ghost), .=plains, F=forest, M=mountain, ~=sea, ?=fogged.\n");
+    s.push_str(
+        "\nLegend: U=your unit (can act), u=acted, E=enemy unit, \
+         H=your HQ, X=enemy HQ, F=your factory, Y=enemy factory, f=neutral factory, \
+         C=your city, K=enemy city, c=neutral city, \
+         .=plains, ^=forest, M=mountain, ~=sea, ?=fogged. \
+         The building list below shows ghost/live status and HP for each building.\n"
+    );
 
     let mut mine: Vec<&Unit> = view.units.iter().filter(|u| u.owner == me).collect();
     let mut theirs: Vec<&Unit> = view.units.iter().filter(|u| u.owner != me).collect();
@@ -841,41 +914,77 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         ));
     }
 
-    // Buildings — own HQs are always current; enemy HQs may be ghosts.
-    let mine_hq: Vec<_> = view
-        .buildings
-        .iter()
-        .filter(|rb| rb.building.owner == me)
-        .collect();
-    let enemy_hq: Vec<_> = view
-        .buildings
-        .iter()
-        .filter(|rb| rb.building.owner != me)
-        .collect();
-    if !mine_hq.is_empty() {
+    // Buildings — partition into your buildings, enemy buildings (with
+    // ghost/live status), and neutral buildings (cities you've discovered).
+    let mut mine = Vec::new();
+    let mut enemy = Vec::new();
+    let mut neutral = Vec::new();
+    for rb in &view.buildings {
+        match rb.building.owner {
+            Some(o) if o == me => mine.push(rb),
+            Some(_) => enemy.push(rb),
+            None => neutral.push(rb),
+        }
+    }
+    let kind_label = |k: agent_wars::game::BuildingKind| match k {
+        agent_wars::game::BuildingKind::Hq => "HQ",
+        agent_wars::game::BuildingKind::Factory => "Factory",
+        agent_wars::game::BuildingKind::City => "City",
+    };
+    if !mine.is_empty() {
         s.push_str("\nYour buildings:\n");
-        for rb in &mine_hq {
+        for rb in &mine {
+            let extra = if rb.building.kind == agent_wars::game::BuildingKind::Hq {
+                format!(" hp={}/{}", rb.building.hp, rb.building.kind.max_hp())
+            } else if rb.building.kind == agent_wars::game::BuildingKind::Factory {
+                format!(" id={}", rb.building.id)
+            } else {
+                String::new()
+            };
             s.push_str(&format!(
-                "  HQ hp={}/{} at [{},{}]\n",
-                rb.building.hp,
-                rb.building.kind.max_hp(),
+                "  {}{} at [{},{}]\n",
+                kind_label(rb.building.kind),
+                extra,
                 rb.building.pos.0,
-                rb.building.pos.1
+                rb.building.pos.1,
             ));
         }
     }
-    if !enemy_hq.is_empty() {
+    if !enemy.is_empty() {
         s.push_str("\nKnown enemy buildings:\n");
-        for rb in &enemy_hq {
+        for rb in &enemy {
+            let tag = if rb.currently_visible {
+                "live"
+            } else {
+                "ghost / last seen"
+            };
+            let extra = if rb.building.kind == agent_wars::game::BuildingKind::Hq {
+                format!(" hp={}/{}", rb.building.hp, rb.building.kind.max_hp())
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "  {}{} at [{},{}] ({}, last seen turn {})\n",
+                kind_label(rb.building.kind),
+                extra,
+                rb.building.pos.0,
+                rb.building.pos.1,
+                tag,
+                rb.last_seen_turn,
+            ));
+        }
+    }
+    if !neutral.is_empty() {
+        s.push_str("\nKnown neutral buildings (capturable):\n");
+        for rb in &neutral {
             let tag = if rb.currently_visible {
                 "live"
             } else {
                 "ghost / last seen"
             };
             s.push_str(&format!(
-                "  HQ hp={}/{} at [{},{}] ({}, last seen turn {})\n",
-                rb.building.hp,
-                rb.building.kind.max_hp(),
+                "  {} at [{},{}] ({}, last seen turn {})\n",
+                kind_label(rb.building.kind),
                 rb.building.pos.0,
                 rb.building.pos.1,
                 tag,
@@ -886,9 +995,33 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
     s
 }
 
+fn building_glyph(rb: &agent_wars::game::RememberedBuilding, me: PlayerId) -> char {
+    use agent_wars::game::BuildingKind;
+    let mine = rb.building.owner == Some(me);
+    let neutral = rb.building.owner.is_none();
+    match rb.building.kind {
+        BuildingKind::Hq => if mine { 'H' } else { 'X' },
+        BuildingKind::Factory => if mine { 'F' } else if neutral { 'f' } else { 'Y' },
+        BuildingKind::City => if mine { 'C' } else if neutral { 'c' } else { 'K' },
+    }
+}
+
 fn unit_kind_name(k: UnitKind) -> &'static str {
     match k {
         UnitKind::Infantry => "infantry",
+        UnitKind::Scout => "scout",
+        UnitKind::HeavyInfantry => "heavy_infantry",
+    }
+}
+
+fn parse_unit_kind(s: &str) -> Result<UnitKind, String> {
+    match s.to_lowercase().replace('-', "_").as_str() {
+        "infantry" => Ok(UnitKind::Infantry),
+        "scout" => Ok(UnitKind::Scout),
+        "heavy_infantry" | "heavyinfantry" | "heavy" => Ok(UnitKind::HeavyInfantry),
+        other => Err(format!(
+            "unknown unit kind '{other}' (use infantry, scout, or heavy_infantry)"
+        )),
     }
 }
 
@@ -985,7 +1118,7 @@ fn summarize_final_state(view: &PlayerView, me: PlayerId) -> String {
         let bldgs: Vec<&agent_wars::game::RememberedBuilding> = view
             .buildings
             .iter()
-            .filter(|rb| rb.building.owner == owner)
+            .filter(|rb| rb.building.owner == Some(owner))
             .collect();
         let label = if owner == me { "you" } else { "opponent" };
         s.push_str(&format!(

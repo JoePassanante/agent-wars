@@ -174,6 +174,12 @@ async fn handle_command(state: &AppState, view: View, cmd: ClientMsg) -> Result<
             let _ = state.tx.send(());
             Ok(())
         }
+        ClientMsg::BuyUnit { factory_id, kind } => {
+            g.try_buy_unit(actor, factory_id, kind)?;
+            drop(g);
+            let _ = state.tx.send(());
+            Ok(())
+        }
         ClientMsg::EndTurn => {
             g.end_turn(actor)?;
             drop(g);
