@@ -1068,6 +1068,9 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         "Rules:\n\
          • Win ONLY by destroying the enemy HQ (10 HP) or by their surrender. \
            Losing all your units does NOT lose the game — rebuild at your factory or hold your HQ.\n\
+         • Each turn, every one of your units gets exactly ONE action (move, move+attack, or stay-and-attack). \
+           There is NO LIMIT on how many of your units you may act with per turn — act with all of them \
+           if you can. Each factory can produce up to ONE unit per turn (separate from unit actions).\n\
          • Cities/factories are captured by ending your turn standing on them. Capture is INSTANT \
            on end_turn (one round of standing). Capture flips ownership; the city pays its income \
            on the NEXT turn cycle (250g/turn). HQs and factories pay 1000g/turn each.\n\
