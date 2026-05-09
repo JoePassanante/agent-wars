@@ -610,6 +610,12 @@ async fn handle_buy_unit(client: &Arc<McpClient>, args: &Value) -> Result<String
 }
 
 async fn handle_end_turn(client: &Arc<McpClient>) -> Result<String, String> {
+    // Snapshot building ownership and our funds before the turn flips so we
+    // can call out captures and the income tick to the agent explicitly —
+    // diffing state in their head is where the hallucinations come from.
+    let prev = client.state.lock().await.clone();
+    let me = client.player;
+
     let mut events = client.events.subscribe();
     client
         .cmd_tx
@@ -618,10 +624,62 @@ async fn handle_end_turn(client: &Arc<McpClient>) -> Result<String, String> {
         .map_err(|_| "writer task dead".to_string())?;
     match wait_for_response(&mut events).await? {
         ServerMsg::Error { message } => Err(message),
-        ServerMsg::State(new) => Ok(format!(
-            "Turn ended. Now turn {}, active player: {:?}.\n",
-            new.turn_number, new.current_turn
-        )),
+        ServerMsg::State(new) => {
+            let mut s = format!(
+                "Turn ended. Now turn {}, active player: {:?}.",
+                new.turn_number, new.current_turn
+            );
+            if let Some(prev_view) = prev {
+                // Capture report — every building whose owner changed.
+                use agent_wars::game::BuildingKind;
+                let kind_label = |k: BuildingKind| match k {
+                    BuildingKind::Hq => "HQ",
+                    BuildingKind::Factory => "Factory",
+                    BuildingKind::City => "City",
+                };
+                let owner_label = |o: Option<PlayerId>| -> String {
+                    match o {
+                        None => "neutral".into(),
+                        Some(p) if p == me => "you".into(),
+                        Some(p) => format!("{:?}", p),
+                    }
+                };
+                for nb in &new.buildings {
+                    if let Some(pb) = prev_view
+                        .buildings
+                        .iter()
+                        .find(|p| p.building.id == nb.building.id)
+                    {
+                        if pb.building.owner != nb.building.owner {
+                            s.push_str(&format!(
+                                "\nCapture: {} at [{},{}] flipped {} -> {}.",
+                                kind_label(nb.building.kind),
+                                nb.building.pos.0,
+                                nb.building.pos.1,
+                                owner_label(pb.building.owner),
+                                owner_label(nb.building.owner),
+                            ));
+                        }
+                    }
+                }
+                // Income tick (fund delta on the incoming player only).
+                let active = new.current_turn;
+                let before = prev_view.funds.get(&active).copied();
+                let after = new.funds.get(&active).copied();
+                if let (Some(b), Some(a)) = (before, after) {
+                    if a > b {
+                        s.push_str(&format!(
+                            "\nIncome: {:?} collected {}g (now {}g).",
+                            active,
+                            a - b,
+                            a
+                        ));
+                    }
+                }
+            }
+            s.push('\n');
+            Ok(s)
+        }
         _ => Err("unexpected server response".into()),
     }
 }
@@ -1149,6 +1207,31 @@ fn format_action_report(
                 ));
             }
             _ => {}
+        }
+    }
+
+    // If the acting unit ended its move on a capturable building someone
+    // else (or no one) owns, hint that ending turn here will flip it.
+    if let Some(unit_now) = new.units.iter().find(|u| u.id == unit_id) {
+        if let Some(rb) = new.buildings.iter().find(|rb| rb.building.pos == unit_now.pos) {
+            use agent_wars::game::BuildingKind;
+            let mine = rb.building.owner == Some(me);
+            if !mine && matches!(rb.building.kind, BuildingKind::City | BuildingKind::Factory) {
+                let kind = match rb.building.kind {
+                    BuildingKind::City => "city",
+                    BuildingKind::Factory => "factory",
+                    BuildingKind::Hq => "hq",
+                };
+                let owner = match rb.building.owner {
+                    None => "neutral".to_string(),
+                    Some(o) => format!("{:?}", o),
+                };
+                s.push_str(&format!(
+                    "Standing on {} {} at [{},{}] — end your turn here to capture it (instant). \
+                     This building is NOT the enemy HQ; you damage HQs by attacking them.\n",
+                    owner, kind, unit_now.pos.0, unit_now.pos.1
+                ));
+            }
         }
     }
 

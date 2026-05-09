@@ -429,10 +429,6 @@ fn is_buildable(t: Terrain) -> bool {
     matches!(t, Terrain::Plains)
 }
 
-/// Units can spawn or stand on any non-sea tile.
-fn is_passable(t: Terrain) -> bool {
-    !matches!(t, Terrain::Sea)
-}
 
 fn pick_random_buildable(
     map: &Map,
