@@ -23,19 +23,30 @@ pub enum Terrain {
     Sea,
 }
 
+/// Mountains are punishing: a unit can only enter one mountain tile per
+/// turn. The pathfinder tracks `mountains_entered` as part of its state so
+/// any path that would step into a second mountain is rejected.
+pub const MAX_MOUNTAIN_CROSSINGS_PER_TURN: u32 = 1;
+
 impl Terrain {
-    /// Movement cost for infantry. None = impassable.
-    pub fn infantry_move_cost(self) -> Option<u32> {
-        match self {
-            Terrain::Plains => Some(1),
-            Terrain::Forest => Some(1),
-            Terrain::Mountain => Some(2),
-            Terrain::Sea => None,
+    /// Movement cost for the given unit kind, or `None` if impassable.
+    /// Forest only slows non-scouts: scouts move through woods at plains
+    /// speed. Mountains cost 2 and additionally trigger the per-turn cap.
+    pub fn move_cost_for(self, kind: UnitKind) -> Option<u32> {
+        use Terrain::*;
+        use UnitKind::*;
+        match (self, kind) {
+            (Sea, _) => None,
+            (Plains, _) => Some(1),
+            (Forest, Scout) => Some(1),
+            (Forest, _) => Some(2),
+            (Mountain, _) => Some(2),
         }
     }
 
-    /// Defense stars (Advance Wars-style; higher = more damage reduction).
-    pub fn defense(self) -> u32 {
+    /// Defense stars granted by standing on this terrain. Stars × 10% scale
+    /// with the defender's HP fraction in the damage formula.
+    pub fn defense_stars_for(self, _kind: UnitKind) -> u32 {
         match self {
             Terrain::Plains => 1,
             Terrain::Forest => 2,
@@ -199,7 +210,22 @@ impl BuildingKind {
         match self {
             BuildingKind::Hq => 1000,
             BuildingKind::Factory => 1000,
-            BuildingKind::City => 1000,
+            BuildingKind::City => 250,
+        }
+    }
+    /// Extra defense stars when a unit of the given kind is occupying this
+    /// building tile. Stack on top of `Terrain::defense_stars_for`.
+    /// Infantry get a fortification bonus inside cities; scouts and heavies
+    /// don't get the same urban-warfare advantage.
+    pub fn defense_stars_for(self, kind: UnitKind) -> u32 {
+        use BuildingKind::*;
+        use UnitKind::*;
+        match (self, kind) {
+            (City, Infantry) => 3,
+            (City, _) => 2,
+            (Factory, Infantry) => 3,
+            (Factory, _) => 2,
+            (Hq, _) => 4,
         }
     }
 }
@@ -482,7 +508,7 @@ fn pick_starting_units(
     // start (weird for an opening) and mountains slow first-turn movement
     // for everything except heavy infantry. Pure plains keeps openings fair.
     let mut candidates: Vec<Coord> = Vec::new();
-    let mut consider = |candidates: &mut Vec<Coord>, n: Coord| {
+    let consider = |candidates: &mut Vec<Coord>, n: Coord| {
         if !map.in_bounds(n) {
             return;
         }
@@ -752,76 +778,117 @@ impl GameState {
         self.buildings.values().find(|b| b.pos == c)
     }
 
+    /// Total defensive stars a unit gets on its current tile: terrain stars
+    /// plus any building stars granted to that unit kind. This is the single
+    /// extension point for "infantry on city = +3", "scout in mountain = +N",
+    /// etc. Adjust the underlying `defense_stars_for` methods to expand.
+    pub fn defense_stars_for_unit(&self, unit: &Unit) -> u32 {
+        let terrain = self
+            .map
+            .terrain(unit.pos)
+            .map(|t| t.defense_stars_for(unit.kind))
+            .unwrap_or(0);
+        let bldg = self
+            .building_at(unit.pos)
+            .map(|b| b.kind.defense_stars_for(unit.kind))
+            .unwrap_or(0);
+        terrain + bldg
+    }
+
+    /// Defensive stars when the building itself is the attack target
+    /// (currently only HQs, since cities/factories are captured rather than
+    /// destroyed). Uses terrain stars only — buildings don't grant
+    /// additional armor to themselves.
+    pub fn defense_stars_for_building(&self, b: &Building) -> u32 {
+        self.map
+            .terrain(b.pos)
+            .map(|t| t.defense_stars_for(UnitKind::Infantry))
+            .unwrap_or(0)
+    }
+
     pub fn unit_at(&self, c: Coord) -> Option<&Unit> {
         self.units.values().find(|u| u.pos == c)
     }
 
-    /// Compute reachable tiles for a unit using Dijkstra over terrain costs.
-    /// Cannot pass through enemy units. Cannot stop on a tile occupied by another unit.
+    /// Compute reachable tiles for a unit. State-tracked Dijkstra over
+    /// (coord, mountains_crossed) so we can reject paths that exceed the
+    /// MAX_MOUNTAIN_CROSSINGS_PER_TURN limit.
     pub fn reachable(&self, unit_id: Uuid) -> HashMap<Coord, u32> {
         let Some(unit) = self.units.get(&unit_id) else {
             return HashMap::new();
         };
         let mp = unit.kind.move_points();
 
-        // Coord -> best cost to reach
-        let mut best: HashMap<Coord, u32> = HashMap::new();
-        best.insert(unit.pos, 0);
+        let mut best: HashMap<(Coord, u32), u32> = HashMap::new();
+        best.insert((unit.pos, 0), 0);
 
-        // Min-heap on cost
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, Coord)>> = BinaryHeap::new();
-        heap.push(std::cmp::Reverse((0, unit.pos)));
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, Coord, u32)>> = BinaryHeap::new();
+        heap.push(std::cmp::Reverse((0, unit.pos, 0)));
 
-        while let Some(std::cmp::Reverse((cost, pos))) = heap.pop() {
-            if cost > *best.get(&pos).unwrap_or(&u32::MAX) {
+        while let Some(std::cmp::Reverse((cost, pos, m))) = heap.pop() {
+            if cost > *best.get(&(pos, m)).unwrap_or(&u32::MAX) {
                 continue;
             }
             for n in neighbors4(pos) {
                 let Some(terrain) = self.map.terrain(n) else {
                     continue;
                 };
-                let Some(step) = terrain.infantry_move_cost() else {
+                let Some(step) = terrain.move_cost_for(unit.kind) else {
                     continue;
                 };
-                // Block movement through enemy units.
                 if let Some(other) = self.unit_at(n) {
                     if other.owner != unit.owner {
                         continue;
                     }
                 }
-                // HQs block movement; factories and cities are passable.
                 if let Some(b) = self.building_at(n) {
                     if b.kind.blocks_movement() {
                         continue;
                     }
                 }
+                let new_m = if terrain == Terrain::Mountain {
+                    m + 1
+                } else {
+                    m
+                };
+                if new_m > MAX_MOUNTAIN_CROSSINGS_PER_TURN {
+                    continue;
+                }
                 let new_cost = cost + step;
                 if new_cost > mp {
                     continue;
                 }
-                if new_cost < *best.get(&n).unwrap_or(&u32::MAX) {
-                    best.insert(n, new_cost);
-                    heap.push(std::cmp::Reverse((new_cost, n)));
+                if new_cost < *best.get(&(n, new_m)).unwrap_or(&u32::MAX) {
+                    best.insert((n, new_m), new_cost);
+                    heap.push(std::cmp::Reverse((new_cost, n, new_m)));
                 }
             }
         }
 
-        // Filter out tiles occupied by other units or by a movement-blocking
-        // building (HQ). Cities/factories are valid destinations because units
-        // can stand on them to capture or to spawn from.
-        best.retain(|&pos, _| {
+        // Aggregate (coord, m) → coord with cheapest reach.
+        let mut min_cost: HashMap<Coord, u32> = HashMap::new();
+        for ((c, _), cost) in best {
+            let entry = min_cost.entry(c).or_insert(u32::MAX);
+            if cost < *entry {
+                *entry = cost;
+            }
+        }
+
+        // Can't stop on tiles occupied by other units or movement-blocking buildings.
+        min_cost.retain(|&pos, _| {
             pos == unit.pos
                 || (self.unit_at(pos).is_none()
                     && self
                         .building_at(pos)
                         .map_or(true, |b| !b.kind.blocks_movement()))
         });
-        best
+        min_cost
     }
 
     /// Reconstruct the cheapest path the unit would walk to `dest` using the
-    /// same constraints as `reachable`. Returns the path including start and
-    /// end positions, or `None` if `dest` isn't actually reachable.
+    /// same constraints as `reachable` (terrain costs, mountain cap, blocked
+    /// tiles). Returns the path including start and end, or `None` if `dest`
+    /// isn't reachable under those constraints.
     pub fn compute_path(&self, unit_id: Uuid, dest: Coord) -> Option<Vec<Coord>> {
         let unit = self.units.get(&unit_id)?;
         let mp = unit.kind.move_points();
@@ -830,21 +897,21 @@ impl GameState {
             return Some(vec![start]);
         }
 
-        let mut best: HashMap<Coord, u32> = HashMap::new();
-        let mut parent: HashMap<Coord, Coord> = HashMap::new();
-        best.insert(start, 0);
-        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, Coord)>> = BinaryHeap::new();
-        heap.push(std::cmp::Reverse((0, start)));
+        let mut best: HashMap<(Coord, u32), u32> = HashMap::new();
+        let mut parent: HashMap<(Coord, u32), (Coord, u32)> = HashMap::new();
+        best.insert((start, 0), 0);
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, Coord, u32)>> = BinaryHeap::new();
+        heap.push(std::cmp::Reverse((0, start, 0)));
 
-        while let Some(std::cmp::Reverse((cost, pos))) = heap.pop() {
-            if cost > *best.get(&pos).unwrap_or(&u32::MAX) {
+        while let Some(std::cmp::Reverse((cost, pos, m))) = heap.pop() {
+            if cost > *best.get(&(pos, m)).unwrap_or(&u32::MAX) {
                 continue;
             }
             for n in neighbors4(pos) {
                 let Some(terrain) = self.map.terrain(n) else {
                     continue;
                 };
-                let Some(step) = terrain.infantry_move_cost() else {
+                let Some(step) = terrain.move_cost_for(unit.kind) else {
                     continue;
                 };
                 if let Some(other) = self.unit_at(n) {
@@ -857,26 +924,44 @@ impl GameState {
                         continue;
                     }
                 }
+                let new_m = if terrain == Terrain::Mountain {
+                    m + 1
+                } else {
+                    m
+                };
+                if new_m > MAX_MOUNTAIN_CROSSINGS_PER_TURN {
+                    continue;
+                }
                 let new_cost = cost + step;
                 if new_cost > mp {
                     continue;
                 }
-                if new_cost < *best.get(&n).unwrap_or(&u32::MAX) {
-                    best.insert(n, new_cost);
-                    parent.insert(n, pos);
-                    heap.push(std::cmp::Reverse((new_cost, n)));
+                if new_cost < *best.get(&(n, new_m)).unwrap_or(&u32::MAX) {
+                    best.insert((n, new_m), new_cost);
+                    parent.insert((n, new_m), (pos, m));
+                    heap.push(std::cmp::Reverse((new_cost, n, new_m)));
                 }
             }
         }
 
-        if !best.contains_key(&dest) {
-            return None;
+        // Pick the (dest, m) with the lowest cost.
+        let mut chosen: Option<(u32, u32)> = None; // (m, cost)
+        for m in 0..=MAX_MOUNTAIN_CROSSINGS_PER_TURN {
+            if let Some(&c) = best.get(&(dest, m)) {
+                match chosen {
+                    None => chosen = Some((m, c)),
+                    Some((_, prev)) if c < prev => chosen = Some((m, c)),
+                    _ => {}
+                }
+            }
         }
+        let (mut m_cur, _) = chosen?;
         let mut path = vec![dest];
         let mut cur = dest;
-        while let Some(&p) = parent.get(&cur) {
+        while let Some(&(p, pm)) = parent.get(&(cur, m_cur)) {
             path.push(p);
             cur = p;
+            m_cur = pm;
             if cur == start {
                 break;
             }
@@ -982,9 +1067,8 @@ impl GameState {
             Some(AttackTarget::Unit(target_id)) => {
                 let attacker = self.units[&unit_id].clone();
                 let defender = self.units[&target_id].clone();
-                let defender_terrain =
-                    self.map.terrain(defender.pos).unwrap_or(Terrain::Plains);
-                let dmg = compute_damage(&attacker, defender_terrain, &defender);
+                let def_stars = self.defense_stars_for_unit(&defender);
+                let dmg = compute_damage(&attacker, def_stars, &defender);
                 report.target_id = Some(target_id);
                 report.target_kind = Some(TargetKind::Unit);
                 report.damage_to_defender = Some(dmg);
@@ -1001,17 +1085,13 @@ impl GameState {
                     let (dmin, dmax) = defender.kind.attack_range();
                     let m = (defender.pos.0 - dest.0).abs() + (defender.pos.1 - dest.1).abs();
                     if m >= dmin && m <= dmax {
-                        let attacker_terrain =
-                            self.map.terrain(dest).unwrap_or(Terrain::Plains);
-                        let counter = compute_damage(
-                            &defender,
-                            attacker_terrain,
-                            &self.units[&unit_id],
-                        );
+                        let atk = self.units[&unit_id].clone();
+                        let atk_stars = self.defense_stars_for_unit(&atk);
+                        let counter = compute_damage(&defender, atk_stars, &atk);
                         report.damage_to_attacker = Some(counter);
-                        let atk = self.units.get_mut(&unit_id).unwrap();
-                        atk.hp = atk.hp.saturating_sub(counter);
-                        if atk.hp == 0 {
+                        let atk_mut = self.units.get_mut(&unit_id).unwrap();
+                        atk_mut.hp = atk_mut.hp.saturating_sub(counter);
+                        if atk_mut.hp == 0 {
                             self.units.remove(&unit_id);
                             report.attacker_killed = true;
                         }
@@ -1021,8 +1101,8 @@ impl GameState {
             Some(AttackTarget::Building(target_id)) => {
                 let attacker = self.units[&unit_id].clone();
                 let bld = self.buildings[&target_id].clone();
-                let bld_terrain = self.map.terrain(bld.pos).unwrap_or(Terrain::Plains);
-                let dmg = compute_damage_vs_building(&attacker, bld_terrain, &bld);
+                let def_stars = self.defense_stars_for_building(&bld);
+                let dmg = compute_damage_vs_building(&attacker, def_stars, &bld);
                 report.target_id = Some(target_id);
                 report.target_kind = Some(TargetKind::Building);
                 report.damage_to_defender = Some(dmg);
@@ -1239,38 +1319,33 @@ enum AttackTarget {
 }
 
 /// Damage formula against buildings. Same shape as unit-vs-unit but uses
-/// `base_damage_vs_building` and the building's HP for terrain reduction
-/// scaling.
-pub fn compute_damage_vs_building(
-    attacker: &Unit,
-    target_terrain: Terrain,
-    target: &Building,
-) -> u32 {
+/// `base_damage_vs_building`. `def_stars` should be the total defensive
+/// stars the building's tile grants the building (terrain + the building's
+/// own defense bonus).
+pub fn compute_damage_vs_building(attacker: &Unit, def_stars: u32, target: &Building) -> u32 {
     let base = attacker.kind.base_damage_vs_building(target.kind) as f32;
     let max_hp = UnitKind::max_hp(attacker.kind) as f32;
     let atk_hp_ratio = attacker.hp as f32 / max_hp;
     let raw = base * atk_hp_ratio / 10.0;
-    let def_stars = target_terrain.defense() as f32;
     let def_hp_ratio = target.hp as f32 / target.kind.max_hp() as f32;
-    let reduction = (def_stars * 0.1 * def_hp_ratio).clamp(0.0, 0.9);
+    let reduction = (def_stars as f32 * 0.1 * def_hp_ratio).clamp(0.0, 0.9);
     let final_dmg = raw * (1.0 - reduction);
     final_dmg.round().max(0.0) as u32
 }
 
-/// Compute damage in HP points an attacker deals to a defender on the given terrain.
-/// Simplified Advance Wars formula: scaled base damage × attacker HP, reduced by
-/// defender terrain stars × defender HP ratio.
-pub fn compute_damage(attacker: &Unit, defender_terrain: Terrain, defender: &Unit) -> u32 {
+/// Compute damage to a defender unit. `def_stars` is the precomputed total
+/// defensive stars for the defender on its current tile (terrain + building
+/// bonus). Pulling the lookup out of this function lets the engine apply
+/// per-unit-kind tile effects without changing the formula.
+pub fn compute_damage(attacker: &Unit, def_stars: u32, defender: &Unit) -> u32 {
     let Some(base) = attacker.kind.base_damage(defender.kind) else {
         return 0;
     };
     let max_hp = UnitKind::max_hp(attacker.kind) as f32;
     let atk_hp_ratio = attacker.hp as f32 / max_hp;
-    // Raw HP damage out of 10.
     let raw = base as f32 * atk_hp_ratio / 10.0;
-    let def_stars = defender_terrain.defense() as f32;
     let def_hp_ratio = defender.hp as f32 / max_hp;
-    let reduction = (def_stars * 0.1 * def_hp_ratio).clamp(0.0, 0.9);
+    let reduction = (def_stars as f32 * 0.1 * def_hp_ratio).clamp(0.0, 0.9);
     let final_dmg = raw * (1.0 - reduction);
     final_dmg.round().max(0.0) as u32
 }
@@ -1793,7 +1868,11 @@ mod tests {
         add_building(&mut g, BuildingKind::City, Some(PlayerId::P2), (4, 0));
         // P1 ends turn -> income tick happens for P2 (incoming player).
         g.end_turn(PlayerId::P1).unwrap();
-        assert_eq!(g.funds.get(&PlayerId::P2).copied(), Some(1000));
+        assert_eq!(
+            g.funds.get(&PlayerId::P2).copied(),
+            Some(BuildingKind::City.income_per_turn()),
+            "city income changed"
+        );
         assert_eq!(g.funds.get(&PlayerId::P1).copied(), Some(0));
     }
 
@@ -1844,6 +1923,81 @@ mod tests {
             .try_buy_unit(PlayerId::P1, factory, UnitKind::Infantry)
             .unwrap_err();
         assert!(err.contains("insufficient funds"), "got: {err}");
+    }
+
+    #[test]
+    fn mountain_cap_blocks_two_in_one_turn() {
+        // Sea-walled corridor forces the unit to traverse two adjacent
+        // mountains to cross. Without the cap a scout could afford the cost;
+        // with MAX_MOUNTAIN_CROSSINGS_PER_TURN=1 the second tile is rejected.
+        let mut tiles = vec![Terrain::Sea; 4 * 3];
+        // Row y=1: plains, mountain, mountain, plains
+        tiles[1 * 4 + 0] = Terrain::Plains;
+        tiles[1 * 4 + 1] = Terrain::Mountain;
+        tiles[1 * 4 + 2] = Terrain::Mountain;
+        tiles[1 * 4 + 3] = Terrain::Plains;
+        let map = Map {
+            width: 4,
+            height: 3,
+            tiles,
+        };
+        let mut g = place(map, vec![(PlayerId::P1, (0, 1), 10)]);
+        let id = id_of(&g, PlayerId::P1, (0, 1));
+        g.units.get_mut(&id).unwrap().kind = UnitKind::Scout;
+        let r = g.reachable(id);
+        // First mountain entry is fine.
+        assert!(r.contains_key(&(1, 1)));
+        // Second mountain entry blocked → (2,1) and (3,1) unreachable.
+        assert!(!r.contains_key(&(2, 1)));
+        assert!(!r.contains_key(&(3, 1)));
+    }
+
+    #[test]
+    fn forest_costs_differ_by_unit_kind() {
+        // Forest in front of a scout costs 1 (no penalty); for infantry it
+        // costs 2 — half the unit's whole turn.
+        let mut tiles = vec![Terrain::Plains; 4 * 4];
+        tiles[(0 * 4 + 1) as usize] = Terrain::Forest;
+        let map = Map {
+            width: 4,
+            height: 4,
+            tiles,
+        };
+
+        let mut g = place(map.clone(), vec![(PlayerId::P1, (0, 0), 10)]);
+        let id = id_of(&g, PlayerId::P1, (0, 0));
+        g.units.get_mut(&id).unwrap().kind = UnitKind::Scout;
+        let r = g.reachable(id);
+        assert_eq!(r.get(&(1, 0)).copied(), Some(1), "scout sails through forest");
+
+        let mut g2 = place(map, vec![(PlayerId::P1, (0, 0), 10)]);
+        let id2 = id_of(&g2, PlayerId::P1, (0, 0));
+        g2.units.get_mut(&id2).unwrap().kind = UnitKind::Infantry;
+        let r2 = g2.reachable(id2);
+        assert_eq!(r2.get(&(1, 0)).copied(), Some(2), "infantry slowed in forest");
+    }
+
+    #[test]
+    fn city_grants_infantry_extra_defense() {
+        let mut tiles = vec![Terrain::Plains; 3 * 3];
+        let map = Map {
+            width: 3,
+            height: 3,
+            tiles,
+        };
+        let mut g = place(
+            map,
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (1, 0), 10)],
+        );
+        // Defender (P2) sits on a city.
+        add_building(&mut g, BuildingKind::City, Some(PlayerId::P2), (1, 0));
+        let atk = id_of(&g, PlayerId::P1, (0, 0));
+        let r = g
+            .try_action(PlayerId::P1, atk, (0, 0), Some((1, 0)))
+            .unwrap();
+        // Plains stars=1 + city stars for infantry=3 => 4 stars total.
+        // base 55 * 1.0 / 10 * (1 - 4*1.0*0.1) = 5.5 * 0.6 = 3.3 -> 3
+        assert_eq!(r.damage_to_defender, Some(3));
     }
 
     #[test]

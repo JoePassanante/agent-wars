@@ -405,10 +405,28 @@ function attackableEnemiesForSelected() {
   return out;
 }
 
+// Mirror of server-side movement rules: per-unit terrain costs and the
+// max-1-mountain-per-turn cap. Used purely for the visual highlight; the
+// server is authoritative for legality.
+const MAX_MOUNTAIN_CROSSINGS_PER_TURN = 1;
+
+function moveCostFor(terrain, kind) {
+  if (terrain === "sea") return null;
+  if (terrain === "plains") return 1;
+  if (terrain === "forest") return kind === "scout" ? 1 : 2;
+  if (terrain === "mountain") return 2;
+  return null;
+}
+
+function movePointsFor(kind) {
+  if (kind === "scout") return 7;
+  if (kind === "heavy_infantry") return 2;
+  return 3; // infantry
+}
+
 function computeReachable(unit) {
   const map = state.map;
-  const mp = 3;
-  const cost = { plains: 1, forest: 1, mountain: 2, sea: null };
+  const mp = movePointsFor(unit.kind);
   const blocked = new Set();
   const friendSet = new Set();
   for (const u of state.units) {
@@ -416,36 +434,45 @@ function computeReachable(unit) {
     if (u.owner !== unit.owner) blocked.add(k);
     else if (u.id !== unit.id) friendSet.add(k);
   }
-  // Only HQs block movement; factories and cities are passable so units
-  // can stand on them to capture or to spawn from.
   for (const b of state.buildings || []) {
     if (b.kind === "hq") blocked.add(`${b.pos[0]},${b.pos[1]}`);
   }
+
+  // State key encodes mountains crossed: "x,y,m".
+  const startKey = `${unit.pos[0]},${unit.pos[1]},0`;
   const best = new Map();
-  best.set(`${unit.pos[0]},${unit.pos[1]}`, 0);
-  const heap = [[0, unit.pos[0], unit.pos[1]]];
+  best.set(startKey, 0);
+  const heap = [[0, unit.pos[0], unit.pos[1], 0]];
   while (heap.length) {
     heap.sort((a, b) => a[0] - b[0]);
-    const [c, x, y] = heap.shift();
-    if (c > (best.get(`${x},${y}`) ?? Infinity)) continue;
+    const [c, x, y, m] = heap.shift();
+    if (c > (best.get(`${x},${y},${m}`) ?? Infinity)) continue;
     for (const [nx, ny] of [[x+1,y],[x-1,y],[x,y+1],[x,y-1]]) {
       if (nx < 0 || ny < 0 || nx >= map.width || ny >= map.height) continue;
       const t = map.tiles[ny * map.width + nx];
-      const step = cost[t];
+      const step = moveCostFor(t, unit.kind);
       if (step == null) continue;
       if (blocked.has(`${nx},${ny}`)) continue;
+      const newM = t === "mountain" ? m + 1 : m;
+      if (newM > MAX_MOUNTAIN_CROSSINGS_PER_TURN) continue;
       const nc = c + step;
       if (nc > mp) continue;
-      const key = `${nx},${ny}`;
+      const key = `${nx},${ny},${newM}`;
       if (nc < (best.get(key) ?? Infinity)) {
         best.set(key, nc);
-        heap.push([nc, nx, ny]);
+        heap.push([nc, nx, ny, newM]);
       }
     }
   }
-  for (const k of friendSet) best.delete(k);
-  best.set(`${unit.pos[0]},${unit.pos[1]}`, 0);
-  return new Set(best.keys());
+  // Aggregate (x, y, m) → cheapest reachable coord.
+  const out = new Set();
+  for (const k of best.keys()) {
+    const [x, y] = k.split(",");
+    out.add(`${x},${y}`);
+  }
+  for (const k of friendSet) out.delete(k);
+  out.add(`${unit.pos[0]},${unit.pos[1]}`);
+  return out;
 }
 
 function render() {

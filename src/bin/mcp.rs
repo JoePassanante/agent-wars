@@ -330,6 +330,34 @@ fn list_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
+            "name": "unit_stats",
+            "description": "Return the full unit roster: cost, move points, vision, max HP, attack range, and the damage matrix (% base damage attacker→defender at full HP, before terrain reduction). Useful for planning matchups before committing to an attack.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "simulate_attack",
+            "description": "Predict the outcome of one of your units attacking a target without actually committing. Returns expected damage to the defender, defender HP after, and counterattack damage to your unit (if defender survives and is in range). Honors current HP, terrain defense (terrain stars + building bonus), and per-unit defense modifiers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "unitId": { "type": "string", "description": "Your attacking unit's UUID." },
+                    "from": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "minItems": 2, "maxItems": 2,
+                        "description": "Tile [x, y] the unit would attack from. Must be in attack range of `target`. Defaults to the unit's current position if omitted."
+                    },
+                    "target": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "minItems": 2, "maxItems": 2,
+                        "description": "[x, y] of the enemy unit OR enemy HQ to attack."
+                    }
+                },
+                "required": ["unitId", "target"]
+            }
+        }),
+        json!({
             "name": "buy_unit",
             "description": "Spend funds to spawn a unit at one of your factories. The factory must be yours, idle this turn, and have an empty tile (no unit standing on it). Newly produced units cannot act this turn. Costs: infantry=1000, scout=3000, heavy_infantry=2500.",
             "inputSchema": {
@@ -393,6 +421,8 @@ async fn dispatch_tool(
         "attackable_targets" => handle_attackable(client, args).await,
         "act" => handle_act(client, args).await,
         "buy_unit" => handle_buy_unit(client, args).await,
+        "unit_stats" => Ok(format_unit_stats()),
+        "simulate_attack" => handle_simulate_attack(client, args).await,
         "end_turn" => handle_end_turn(client).await,
         "wait_for_turn" => handle_wait_for_turn(client, args).await,
         "surrender" => handle_surrender(client).await,
@@ -562,6 +592,174 @@ async fn handle_act(client: &Arc<McpClient>, args: &Value) -> Result<String, Str
             client.player,
         )),
         _ => Err("unexpected server response".into()),
+    }
+}
+
+fn format_unit_stats() -> String {
+    use agent_wars::game::UnitKind::*;
+    let kinds = [Infantry, Scout, HeavyInfantry];
+    let mut s = String::from("Unit roster:\n");
+    for &k in &kinds {
+        s.push_str(&format!(
+            "  {:<14} cost={:>4}g  move={}  vision={}  hp_max={}  range={:?}\n",
+            unit_kind_name(k),
+            k.cost(),
+            k.move_points(),
+            k.vision(),
+            k.max_hp(),
+            k.attack_range(),
+        ));
+    }
+    s.push_str("\nBase damage matrix (attacker → defender, % at full HP, before terrain):\n");
+    s.push_str("                    vs Inf  vs Scout  vs Heavy\n");
+    for &atk in &kinds {
+        let row: Vec<String> = kinds
+            .iter()
+            .map(|d| {
+                atk.base_damage(*d)
+                    .map(|n| format!("{:>5}%", n))
+                    .unwrap_or_else(|| "   --".into())
+            })
+            .collect();
+        s.push_str(&format!(
+            "  {:<14}  {}\n",
+            unit_kind_name(atk),
+            row.join("   ")
+        ));
+    }
+    s.push_str("\nVs HQ base damage:\n");
+    for &atk in &kinds {
+        s.push_str(&format!(
+            "  {:<14} {:>3}%\n",
+            unit_kind_name(atk),
+            atk.base_damage_vs_building(agent_wars::game::BuildingKind::Hq),
+        ));
+    }
+    s.push_str(
+        "\nDamage formula: base × (atk_hp/10) × (1 − def_stars × def_hp_ratio × 0.1).\n\
+         Defense stars stack: terrain (plains 1 / forest 2 / mountain 4) + building \
+         (city/factory: infantry +3, scout/heavy +2; HQ: +4 to its occupant). Cap at 90% reduction.\n",
+    );
+    s
+}
+
+async fn handle_simulate_attack(
+    client: &Arc<McpClient>,
+    args: &Value,
+) -> Result<String, String> {
+    let unit_id = parse_unit_id(args)?;
+    let target_pos = parse_coord(args.get("target"))?;
+    let view = client.state.lock().await.clone().ok_or("no state yet")?;
+    let synth = synthetic_state(&view);
+
+    let attacker = synth
+        .units
+        .get(&unit_id)
+        .ok_or_else(|| format!("unit {unit_id} not visible"))?
+        .clone();
+    if attacker.owner != client.player {
+        return Err("not your unit".into());
+    }
+    let from = match args.get("from") {
+        Some(Value::Null) | None => attacker.pos,
+        Some(v) => parse_coord(Some(v))?,
+    };
+    let manhattan = (from.0 - target_pos.0).abs() + (from.1 - target_pos.1).abs();
+    let (min_r, max_r) = attacker.kind.attack_range();
+    if manhattan < min_r || manhattan > max_r {
+        return Err(format!(
+            "target out of range from {:?} (need {}-{}, got {})",
+            from, min_r, max_r, manhattan
+        ));
+    }
+
+    // Hypothetical attacker — same stats but at `from`.
+    let mut hypo = attacker.clone();
+    hypo.pos = from;
+
+    if let Some(target_unit) = synth.unit_at(target_pos).cloned() {
+        if target_unit.owner == attacker.owner {
+            return Err("target is friendly".into());
+        }
+        let def_stars = synth.defense_stars_for_unit(&target_unit);
+        let dmg = agent_wars::game::compute_damage(&hypo, def_stars, &target_unit);
+        let new_hp = target_unit.hp.saturating_sub(dmg);
+        let mut s = format!(
+            "Attack {} ({}, hp {}/{}) → {} ({}, hp {}/{}).\n  \
+             Defense stars: {} (terrain + building bonus).\n  \
+             Forecast: defender takes {} HP (now {} HP).\n",
+            unit_kind_name(hypo.kind),
+            hypo.id,
+            hypo.hp,
+            UnitKind::max_hp(hypo.kind),
+            unit_kind_name(target_unit.kind),
+            target_unit.id,
+            target_unit.hp,
+            UnitKind::max_hp(target_unit.kind),
+            def_stars,
+            dmg,
+            new_hp,
+        );
+        if new_hp == 0 {
+            s.push_str("  Defender DIES — no counterattack.\n");
+        } else {
+            // Counter from new_hp.
+            let mut counter_def = target_unit.clone();
+            counter_def.hp = new_hp;
+            let atk_after = hypo.clone();
+            // Defender attacks attacker on attacker's tile.
+            // Build a synthetic with attacker moved to `from` for stars.
+            let mut atk_synth = synth.clone();
+            atk_synth.units.insert(hypo.id, atk_after.clone());
+            let atk_stars = atk_synth.defense_stars_for_unit(&atk_after);
+            let counter = agent_wars::game::compute_damage(&counter_def, atk_stars, &atk_after);
+            let atk_new_hp = atk_after.hp.saturating_sub(counter);
+            s.push_str(&format!(
+                "  Counter: defender deals {} HP back; attacker now {} HP{}.\n",
+                counter,
+                atk_new_hp,
+                if atk_new_hp == 0 {
+                    " (DESTROYED)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        Ok(s)
+    } else if let Some(rb) = view.buildings.iter().find(|rb| rb.building.pos == target_pos) {
+        use agent_wars::game::BuildingKind;
+        if rb.building.owner == Some(client.player) {
+            return Err("target is your own building".into());
+        }
+        if !matches!(rb.building.kind, BuildingKind::Hq) {
+            return Err("only HQs are attackable; cities/factories are captured".into());
+        }
+        let def_stars = synth.defense_stars_for_building(&rb.building);
+        let dmg = agent_wars::game::compute_damage_vs_building(&hypo, def_stars, &rb.building);
+        let new_hp = rb.building.hp.saturating_sub(dmg);
+        Ok(format!(
+            "Attack {} ({}, hp {}/{}) → enemy HQ at [{},{}] (hp {}/{}).\n  \
+             Defense stars: {}.\n  \
+             Forecast: HQ takes {} HP (now {} HP){}.\n  \
+             HQs do not counterattack.\n",
+            unit_kind_name(hypo.kind),
+            hypo.id,
+            hypo.hp,
+            UnitKind::max_hp(hypo.kind),
+            target_pos.0,
+            target_pos.1,
+            rb.building.hp,
+            rb.building.kind.max_hp(),
+            def_stars,
+            dmg,
+            new_hp,
+            if new_hp == 0 { " — DESTROYED" } else { "" },
+        ))
+    } else {
+        Err(format!(
+            "no attackable target at [{},{}]",
+            target_pos.0, target_pos.1
+        ))
     }
 }
 
@@ -867,10 +1065,21 @@ fn terrain_glyph(t: Terrain) -> char {
 fn format_state(view: &PlayerView, me: PlayerId) -> String {
     let mut s = String::new();
     s.push_str(
-        "Rules: you win ONLY by destroying the enemy HQ (10 HP) or by their surrender. \
-         Losing all your units does NOT lose the game — you can rebuild at your \
-         factory or hold your HQ. Cities/factories are captured by ending your turn \
-         on them, not destroyed. Surrender is allowed from turn 4 onward.\n\n",
+        "Rules:\n\
+         • Win ONLY by destroying the enemy HQ (10 HP) or by their surrender. \
+           Losing all your units does NOT lose the game — rebuild at your factory or hold your HQ.\n\
+         • Cities/factories are captured by ending your turn standing on them. Capture is INSTANT \
+           on end_turn (one round of standing). Capture flips ownership; the city pays its income \
+           on the NEXT turn cycle (250g/turn). HQs and factories pay 1000g/turn each.\n\
+         • Movement: each tile has a per-unit cost. Plains 1 always; Forest costs 1 for scouts \
+           but 2 for infantry/heavy; Mountain costs 2. A unit can enter AT MOST ONE mountain tile \
+           per turn (hard cap, even if move points remain).\n\
+         • Combat: damage = base × (atk_hp/10) × (1 − def_stars × def_hp_ratio × 0.1). Defenders \
+           counterattack with their post-hit HP if they survive and are in range. HQs do not counter. \
+           Cities/factories cannot be attacked — only captured.\n\
+         • Defense stars: terrain (plains 1, forest 2, mountain 4) + building bonus when occupying \
+           one (city/factory: infantry +3, others +2). Stars stack; cap at 90% damage reduction.\n\
+         • Surrender allowed from turn 4 onward.\n\n",
     );
     s.push_str(&format!(
         "Map seed: {}. Turn {}; active player: {:?}; you are {:?}.\n",
