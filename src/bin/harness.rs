@@ -32,7 +32,9 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-use agent_wars::game::{PlayerId, PlayerView, UnitKind};
+use agent_wars::game::{
+    Building, Coord, GameState, PlayerId, PlayerView, RememberedBuilding, Terrain, Unit, UnitKind,
+};
 use agent_wars::lobby::now_secs;
 use agent_wars::proto::{ClientIntent, ClientMsg, ServerMsg, TurnAction};
 use clap::Parser;
@@ -550,11 +552,11 @@ fn quickjs_main(
         {
             let game_tx = game_tx.clone();
             let f = Function::new(ctx.clone(), move |unit_id: String, to: rquickjs::Value, target: rquickjs::Value| -> rquickjs::Result<String> {
-                let to_coord = parse_coord(&to).map_err(|e| rquickjs::Error::Exception)?;
+                let to_coord = parse_coord_js(&to).map_err(|e| rquickjs::Error::Exception)?;
                 let attack = if target.is_undefined() || target.is_null() {
                     None
                 } else {
-                    Some(parse_coord(&target).map_err(|e| rquickjs::Error::Exception)?)
+                    Some(parse_coord_js(&target).map_err(|e| rquickjs::Error::Exception)?)
                 };
                 let unit_uuid = unit_id.parse::<Uuid>().map_err(|_| rquickjs::Error::Exception)?;
                 let (tx, rx) = oneshot::channel();
@@ -787,7 +789,7 @@ fn stringify_value(v: &rquickjs::Value) -> String {
     "<unprintable>".into()
 }
 
-fn parse_coord(v: &rquickjs::Value) -> Result<(i32, i32), String> {
+fn parse_coord_js(v: &rquickjs::Value) -> Result<(i32, i32), String> {
     let arr = v.as_array().ok_or("expected [x, y] array")?;
     if arr.len() != 2 {
         return Err("coord must have exactly 2 elements".into());
@@ -809,12 +811,12 @@ fn parse_actions(v: &rquickjs::Value) -> Result<Vec<TurnAction>, String> {
                 let unit_id_str: String = obj.get("unitId").map_err(|e| e.to_string())?;
                 let unit_id: Uuid = unit_id_str.parse().map_err(|e: uuid::Error| e.to_string())?;
                 let to_v: rquickjs::Value = obj.get("to").map_err(|e| e.to_string())?;
-                let to = parse_coord(&to_v)?;
+                let to = parse_coord_js(&to_v)?;
                 let attack = if let Ok(t) = obj.get::<_, rquickjs::Value>("target") {
                     if t.is_undefined() || t.is_null() {
                         None
                     } else {
-                        Some(parse_coord(&t)?)
+                        Some(parse_coord_js(&t)?)
                     }
                 } else {
                     None
@@ -1076,7 +1078,7 @@ fn list_tools() -> Vec<Value> {
         }),
         json!({
             "name": "wait_for_turn",
-            "description": "Block until it's THIS player's turn (or the game ends), then return. Use this between rounds — the canonical loop is `wait_for_turn → on_turn → wait_for_turn → ...`. Soft `timeoutSeconds` budget (default 50) so the call returns even if no progress happens; just call again if you get back a 'still waiting' response.",
+            "description": "Block until it's THIS player's turn (or the game ends), then return. Use this between rounds — the canonical loop is `wait_for_turn → on_turn / act / play_turn → wait_for_turn → ...`. Soft `timeoutSeconds` budget (default 50) so the call returns even if no progress happens; just call again if you get back a 'still waiting' response.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1090,6 +1092,95 @@ fn list_tools() -> Vec<Value> {
                 "required": []
             }
         }),
+
+        // ---- Direct game control. The meta-agent can play without writing any
+        //      script by calling these directly. They mirror the agent-wars-mcp
+        //      binary so a single harness registration is all you need.
+        json!({
+            "name": "act",
+            "description": "Move a unit and optionally attack from the destination. `to` is the destination [x, y]; `target` (optional) is [x, y] of an enemy unit or HQ that must be in attack range from `to`. Sets has_moved on the unit. Defenders counterattack at post-hit HP if alive. Cities/factories are captured by ending your turn standing on them, NOT attacked.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "unitId": { "type": "string" },
+                    "to": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                    "target": { "type": ["array", "null"], "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
+                },
+                "required": ["unitId", "to"]
+            }
+        }),
+        json!({
+            "name": "play_turn",
+            "description": "Submit your entire turn in ONE round-trip: an ordered list of move/buy/endTurn actions. Stops at first error (prior actions stay committed). Strongly recommended for the 10s budget — one MCP call instead of N. Action format: { type:'move', unitId, to:[x,y], target?:[x,y] } | { type:'buyUnit', factoryId, kind } | { type:'endTurn' }.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "items": { "type": "object", "properties": { "type": { "type": "string" } }, "required": ["type"] }
+                    }
+                },
+                "required": ["actions"]
+            }
+        }),
+        json!({
+            "name": "end_turn",
+            "description": "End your turn. Capture flips for any of your infantry-class units sitting on a non-friendly capturable building, then the other player gets active and collects income.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "buy_unit",
+            "description": "Spend funds to spawn a unit at one of your factories. Constraints: factory.owner == you, factory tile empty, factory hasn't produced this turn, sufficient funds. Costs: scout=1000g, infantry=2000g, heavy_infantry=3000g. Newly bought units have has_moved=true and CAN'T act this turn.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "factoryId": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["infantry", "scout", "heavy_infantry"] }
+                },
+                "required": ["factoryId", "kind"]
+            }
+        }),
+        json!({
+            "name": "surrender",
+            "description": "Concede the match. Allowed only after turn 4. Idle 5 consecutive turns also auto-surrenders.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "legal_moves",
+            "description": "List tiles a unit can move to this turn, with movement-point cost. The unit's current tile is included with cost 0 (stay put — legal as a stationary attack base).",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "unitId": { "type": "string" } },
+                "required": ["unitId"]
+            }
+        }),
+        json!({
+            "name": "attackable_targets",
+            "description": "List enemies a unit could attack this turn, including the cheapest reachable tile to stand on. Covers both visible enemy units and live enemy HQs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "unitId": { "type": "string" } },
+                "required": ["unitId"]
+            }
+        }),
+        json!({
+            "name": "simulate_attack",
+            "description": "Predict the outcome of attacking a target without committing. Returns expected damage to the defender, defender HP after, counter damage to attacker. Honors current HP and defense-stars stacking.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "unitId": { "type": "string" },
+                    "from": { "type": ["array", "null"], "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 },
+                    "target": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 2 }
+                },
+                "required": ["unitId", "target"]
+            }
+        }),
+        json!({
+            "name": "unit_stats",
+            "description": "Return the full unit roster (cost / move / vision / hp / range) plus the base damage matrix and HQ damage row. Static info — useful for one-shot planning during script authoring.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
     ]
 }
 
@@ -1101,12 +1192,24 @@ async fn dispatch_tool(
     eprintln!("[TOOL] → {name}");
     let started = std::time::Instant::now();
     let result = match name {
+        // Script / sandbox tools.
         "set_script" => handle_set_script(state, args).await,
         "get_script" => handle_get_script(state).await,
         "on_turn" => handle_on_turn(state, args).await,
         "eval" => handle_eval(state, args).await,
+        // Inspection / planning.
         "get_state" => handle_get_state(state).await,
         "wait_for_turn" => handle_wait_for_turn(state, args).await,
+        "legal_moves" => handle_legal_moves(state, args).await,
+        "attackable_targets" => handle_attackable(state, args).await,
+        "simulate_attack" => handle_simulate_attack(state, args).await,
+        "unit_stats" => Ok(handle_unit_stats()),
+        // Direct game control.
+        "act" => handle_act(state, args).await,
+        "play_turn" => handle_play_turn_mcp(state, args).await,
+        "end_turn" => handle_end_turn(state).await,
+        "buy_unit" => handle_buy_unit(state, args).await,
+        "surrender" => handle_surrender_mcp(state).await,
         other => Err(format!("unknown tool: {other}")),
     };
     let elapsed = started.elapsed().as_millis();
@@ -1280,11 +1383,851 @@ async fn handle_wait_for_turn(
 }
 
 async fn handle_get_state(state: &Arc<HarnessState>) -> Result<String, String> {
-    let view = state.state.lock().await.clone();
-    match view {
-        Some(v) => serde_json::to_string_pretty(&v).map_err(|e| e.to_string()),
-        None => Ok("{}".into()),
+    let view = state.state.lock().await.clone().ok_or("no state yet")?;
+    let me = state
+        .player
+        .get()
+        .copied()
+        .ok_or("harness not yet matched into a session")?;
+    Ok(format_state(&view, me))
+}
+
+// ============================================================
+// Direct game-control tools (Phase 1 of the meta-harness merge).
+// Mirror the standalone agent-wars-mcp binary so a single MCP
+// registration is enough for the meta-agent to play directly.
+// ============================================================
+
+async fn send_via_dispatcher(
+    state: &Arc<HarnessState>,
+    msg: ClientMsg,
+) -> Result<ServerMsg, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .game_tx
+        .send(GameCmd::Send { msg, ack: tx })
+        .await
+        .map_err(|_| "writer task dead".to_string())?;
+    rx.await.map_err(|_| "ack channel closed".to_string())?
+}
+
+fn current_player(state: &Arc<HarnessState>) -> Result<PlayerId, String> {
+    state
+        .player
+        .get()
+        .copied()
+        .ok_or_else(|| "harness not yet matched into a session".to_string())
+}
+
+async fn cached_view(state: &Arc<HarnessState>) -> Result<PlayerView, String> {
+    state
+        .state
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "no state yet".to_string())
+}
+
+async fn handle_act(state: &Arc<HarnessState>, args: &Value) -> Result<String, String> {
+    let me = current_player(state)?;
+    let unit_id = parse_unit_id(args)?;
+    let to = parse_coord(args.get("to"))?;
+    let target = match args.get("target") {
+        Some(Value::Null) | None => None,
+        Some(v) => Some(parse_coord(Some(v))?),
+    };
+    let prev = cached_view(state).await?;
+    match send_via_dispatcher(
+        state,
+        ClientMsg::Move {
+            unit_id,
+            to,
+            attack: target,
+        },
+    )
+    .await?
+    {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => Ok(format_action_report(
+            &prev, &new, unit_id, to, target, me,
+        )),
+        _ => Err("unexpected server response".into()),
     }
+}
+
+async fn handle_play_turn_mcp(
+    state: &Arc<HarnessState>,
+    args: &Value,
+) -> Result<String, String> {
+    let me = current_player(state)?;
+    let raw = args
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .ok_or("expected `actions` array")?;
+    if raw.is_empty() {
+        return Err("actions array is empty".into());
+    }
+    let mut actions: Vec<TurnAction> = Vec::with_capacity(raw.len());
+    for (i, v) in raw.iter().enumerate() {
+        let t = v
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("action[{i}]: missing `type`"))?;
+        match t {
+            "move" => {
+                let unit_id =
+                    parse_uuid_field(v, "unitId").map_err(|e| format!("action[{i}].{e}"))?;
+                let to = parse_coord(v.get("to"))
+                    .map_err(|e| format!("action[{i}].to: {e}"))?;
+                let attack = match v.get("target") {
+                    Some(Value::Null) | None => None,
+                    Some(c) => {
+                        Some(parse_coord(Some(c)).map_err(|e| format!("action[{i}].target: {e}"))?)
+                    }
+                };
+                actions.push(TurnAction::Move { unit_id, to, attack });
+            }
+            "buyUnit" => {
+                let factory_id = parse_uuid_field(v, "factoryId")
+                    .map_err(|e| format!("action[{i}].{e}"))?;
+                let kind_str = v
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("action[{i}].kind: required"))?;
+                let kind =
+                    parse_unit_kind(kind_str).map_err(|e| format!("action[{i}].kind: {e}"))?;
+                actions.push(TurnAction::BuyUnit { factory_id, kind });
+            }
+            "endTurn" => actions.push(TurnAction::EndTurn),
+            other => return Err(format!("action[{i}]: unknown type '{other}'")),
+        }
+    }
+    match send_via_dispatcher(state, ClientMsg::PlayTurn { actions }).await? {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => Ok(format!(
+            "play_turn applied. Turn {}, active {:?} (you are {:?}). {}s remaining.\n",
+            new.turn_number,
+            new.current_turn,
+            me,
+            new.turn_deadline_secs.saturating_sub(now_secs())
+        )),
+        _ => Err("unexpected server response".into()),
+    }
+}
+
+async fn handle_end_turn(state: &Arc<HarnessState>) -> Result<String, String> {
+    match send_via_dispatcher(state, ClientMsg::EndTurn).await? {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => Ok(format!(
+            "Turn ended. Now turn {}, active {:?}.",
+            new.turn_number, new.current_turn
+        )),
+        _ => Err("unexpected server response".into()),
+    }
+}
+
+async fn handle_surrender_mcp(state: &Arc<HarnessState>) -> Result<String, String> {
+    match send_via_dispatcher(state, ClientMsg::Surrender).await? {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => Ok(format!(
+            "Surrendered. Winner: {:?}.",
+            new.winner.unwrap_or(current_player(state)?.other())
+        )),
+        _ => Err("unexpected server response".into()),
+    }
+}
+
+async fn handle_buy_unit(state: &Arc<HarnessState>, args: &Value) -> Result<String, String> {
+    let me = current_player(state)?;
+    let factory_id = parse_uuid_field(args, "factoryId")?;
+    let kind_str = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or("kind required")?;
+    let kind = parse_unit_kind(kind_str)?;
+    let prev_funds = cached_view(state)
+        .await
+        .ok()
+        .and_then(|v| v.funds.get(&me).copied())
+        .unwrap_or(0);
+    match send_via_dispatcher(state, ClientMsg::BuyUnit { factory_id, kind }).await? {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => {
+            let new_funds = new.funds.get(&me).copied().unwrap_or(0);
+            let spent = prev_funds.saturating_sub(new_funds);
+            Ok(format!(
+                "Bought {} for {}g. Funds remaining: {}g.",
+                unit_kind_name(kind),
+                spent,
+                new_funds
+            ))
+        }
+        _ => Err("unexpected server response".into()),
+    }
+}
+
+async fn handle_legal_moves(state: &Arc<HarnessState>, args: &Value) -> Result<String, String> {
+    let unit_id = parse_unit_id(args)?;
+    let view = cached_view(state).await?;
+    let synth = synthetic_state(&view);
+    let unit = synth
+        .units
+        .get(&unit_id)
+        .ok_or_else(|| format!("unit {unit_id} not visible"))?;
+    let me = current_player(state)?;
+    if unit.owner != me {
+        return Err("not your unit".into());
+    }
+    let reachable = synth.reachable(unit_id);
+    let mut tiles: Vec<((i32, i32), u32)> = reachable.into_iter().collect();
+    tiles.sort_by_key(|((x, y), c)| (*c, *x, *y));
+    let mut s = format!(
+        "Legal destinations for {} at [{},{}] (move points = {}):\n",
+        unit_id,
+        unit.pos.0,
+        unit.pos.1,
+        unit.kind.move_points()
+    );
+    for ((x, y), cost) in tiles {
+        s.push_str(&format!("  [{x},{y}] cost {cost}\n"));
+    }
+    Ok(s)
+}
+
+async fn handle_attackable(state: &Arc<HarnessState>, args: &Value) -> Result<String, String> {
+    let unit_id = parse_unit_id(args)?;
+    let view = cached_view(state).await?;
+    let synth = synthetic_state(&view);
+    let me = current_player(state)?;
+    let unit = synth
+        .units
+        .get(&unit_id)
+        .ok_or_else(|| format!("unit {unit_id} not visible"))?
+        .clone();
+    if unit.owner != me {
+        return Err("not your unit".into());
+    }
+    let (min_r, max_r) = unit.kind.attack_range();
+    let reachable = synth.reachable(unit_id);
+    let cheapest = |target_pos: Coord| -> Option<Coord> {
+        let mut best: Option<(Coord, u32)> = None;
+        for (&pos, &cost) in &reachable {
+            let d = (pos.0 - target_pos.0).abs() + (pos.1 - target_pos.1).abs();
+            if d >= min_r && d <= max_r {
+                best = match best {
+                    None => Some((pos, cost)),
+                    Some((_, prev)) if cost < prev => Some((pos, cost)),
+                    other => other,
+                };
+            }
+        }
+        best.map(|(p, _)| p)
+    };
+    let mut s = format!("Attackable targets for {}:\n", unit_id);
+    let mut any = false;
+    for u in synth.units.values() {
+        if u.owner == unit.owner {
+            continue;
+        }
+        if let Some(from) = cheapest(u.pos) {
+            any = true;
+            let terrain = view.map.terrain(u.pos).map(terrain_name).unwrap_or("?");
+            s.push_str(&format!(
+                "  unit {} hp={} at [{},{}] on {} — attack from [{},{}]\n",
+                u.id, u.hp, u.pos.0, u.pos.1, terrain, from.0, from.1
+            ));
+        }
+    }
+    for rb in &view.buildings {
+        if rb.building.owner == Some(unit.owner) {
+            continue;
+        }
+        if !rb.currently_visible {
+            continue;
+        }
+        if let Some(from) = cheapest(rb.building.pos) {
+            any = true;
+            let terrain = view.map.terrain(rb.building.pos).map(terrain_name).unwrap_or("?");
+            s.push_str(&format!(
+                "  building {:?} hp={}/{} at [{},{}] on {} — attack from [{},{}]\n",
+                rb.building.kind,
+                rb.building.hp,
+                rb.building.kind.max_hp(),
+                rb.building.pos.0,
+                rb.building.pos.1,
+                terrain,
+                from.0,
+                from.1
+            ));
+        }
+    }
+    if !any {
+        return Ok(format!(
+            "Unit {} cannot reach any visible enemy this turn.\n",
+            unit_id
+        ));
+    }
+    Ok(s)
+}
+
+async fn handle_simulate_attack(
+    state: &Arc<HarnessState>,
+    args: &Value,
+) -> Result<String, String> {
+    let unit_id = parse_unit_id(args)?;
+    let target_pos = parse_coord(args.get("target"))?;
+    let view = cached_view(state).await?;
+    let synth = synthetic_state(&view);
+    let me = current_player(state)?;
+    let attacker = synth
+        .units
+        .get(&unit_id)
+        .ok_or_else(|| format!("unit {unit_id} not visible"))?
+        .clone();
+    if attacker.owner != me {
+        return Err("not your unit".into());
+    }
+    let from = match args.get("from") {
+        Some(Value::Null) | None => attacker.pos,
+        Some(v) => parse_coord(Some(v))?,
+    };
+    let manhattan = (from.0 - target_pos.0).abs() + (from.1 - target_pos.1).abs();
+    let (min_r, max_r) = attacker.kind.attack_range();
+    if manhattan < min_r || manhattan > max_r {
+        return Err(format!(
+            "target out of range from {:?} (need {}-{}, got {})",
+            from, min_r, max_r, manhattan
+        ));
+    }
+    let mut hypo = attacker.clone();
+    hypo.pos = from;
+    if let Some(target_unit) = synth.unit_at(target_pos).cloned() {
+        if target_unit.owner == attacker.owner {
+            return Err("target is friendly".into());
+        }
+        let def_stars = synth.defense_stars_for_unit(&target_unit);
+        let dmg = agent_wars::game::compute_damage(&hypo, def_stars, &target_unit);
+        let new_hp = target_unit.hp.saturating_sub(dmg);
+        let mut s = format!(
+            "Forecast: defender takes {} HP (now {}/{}). def_stars={}. ",
+            dmg,
+            new_hp,
+            UnitKind::max_hp(target_unit.kind),
+            def_stars
+        );
+        if new_hp == 0 {
+            s.push_str("Defender DIES — no counterattack.\n");
+        } else {
+            let mut counter_def = target_unit.clone();
+            counter_def.hp = new_hp;
+            let atk_after = hypo.clone();
+            let mut atk_synth = synth.clone();
+            atk_synth.units.insert(hypo.id, atk_after.clone());
+            let atk_stars = atk_synth.defense_stars_for_unit(&atk_after);
+            let counter =
+                agent_wars::game::compute_damage(&counter_def, atk_stars, &atk_after);
+            let atk_new_hp = atk_after.hp.saturating_sub(counter);
+            s.push_str(&format!(
+                "Counter: attacker takes {} HP (now {}/{}){}.\n",
+                counter,
+                atk_new_hp,
+                UnitKind::max_hp(atk_after.kind),
+                if atk_new_hp == 0 { " (DESTROYED)" } else { "" }
+            ));
+        }
+        Ok(s)
+    } else if let Some(rb) = view.buildings.iter().find(|rb| rb.building.pos == target_pos) {
+        use agent_wars::game::BuildingKind;
+        if rb.building.owner == Some(me) {
+            return Err("target is your own building".into());
+        }
+        if !matches!(rb.building.kind, BuildingKind::Hq) {
+            return Err("only HQs are attackable; cities/factories are captured".into());
+        }
+        let def_stars = synth.defense_stars_for_building(&rb.building);
+        let dmg = agent_wars::game::compute_damage_vs_building(&hypo, def_stars, &rb.building);
+        let new_hp = rb.building.hp.saturating_sub(dmg);
+        Ok(format!(
+            "Forecast vs HQ at [{},{}]: takes {} HP (now {}/{}){}. HQs do not counter.\n",
+            target_pos.0,
+            target_pos.1,
+            dmg,
+            new_hp,
+            rb.building.kind.max_hp(),
+            if new_hp == 0 { " — DESTROYED" } else { "" }
+        ))
+    } else {
+        Err(format!(
+            "no attackable target at [{},{}]",
+            target_pos.0, target_pos.1
+        ))
+    }
+}
+
+fn handle_unit_stats() -> String {
+    use agent_wars::game::UnitKind::*;
+    let kinds = [Infantry, Scout, HeavyInfantry];
+    let mut s = String::from("Unit roster:\n");
+    for &k in &kinds {
+        s.push_str(&format!(
+            "  {:<14} cost={:>4}g  move={}  vision={}  hp_max={}  range={:?}\n",
+            unit_kind_name(k),
+            k.cost(),
+            k.move_points(),
+            k.vision(),
+            k.max_hp(),
+            k.attack_range(),
+        ));
+    }
+    s.push_str("\nBase damage matrix (% at full HP, before terrain):\n");
+    s.push_str("                    vs Inf  vs Scout  vs Heavy\n");
+    for &atk in &kinds {
+        let row: Vec<String> = kinds
+            .iter()
+            .map(|d| {
+                atk.base_damage(*d)
+                    .map(|n| format!("{:>5}%", n))
+                    .unwrap_or_else(|| "   --".into())
+            })
+            .collect();
+        s.push_str(&format!(
+            "  {:<14}  {}\n",
+            unit_kind_name(atk),
+            row.join("   ")
+        ));
+    }
+    s.push_str("\nVs HQ:\n");
+    for &atk in &kinds {
+        s.push_str(&format!(
+            "  {:<14} {:>3}%\n",
+            unit_kind_name(atk),
+            atk.base_damage_vs_building(agent_wars::game::BuildingKind::Hq),
+        ));
+    }
+    s
+}
+
+// =================== Helpers (duplicated from mcp.rs) ===================
+
+fn parse_unit_id(args: &Value) -> Result<Uuid, String> {
+    let s = args
+        .get("unitId")
+        .and_then(|v| v.as_str())
+        .ok_or("unitId required")?;
+    s.parse().map_err(|e: uuid::Error| format!("bad unitId: {e}"))
+}
+
+fn parse_uuid_field(v: &Value, field: &str) -> Result<Uuid, String> {
+    let s = v
+        .get(field)
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| format!("{field}: required"))?;
+    s.parse().map_err(|e: uuid::Error| format!("{field}: {e}"))
+}
+
+fn parse_coord(v: Option<&Value>) -> Result<Coord, String> {
+    let arr = v.and_then(|v| v.as_array()).ok_or("expected [x, y]")?;
+    if arr.len() != 2 {
+        return Err("coord must be [x, y]".into());
+    }
+    let x = arr[0].as_i64().ok_or("x must be integer")? as i32;
+    let y = arr[1].as_i64().ok_or("y must be integer")? as i32;
+    Ok((x, y))
+}
+
+fn parse_unit_kind(s: &str) -> Result<UnitKind, String> {
+    match s.to_lowercase().replace('-', "_").as_str() {
+        "infantry" => Ok(UnitKind::Infantry),
+        "scout" => Ok(UnitKind::Scout),
+        "heavy_infantry" | "heavyinfantry" | "heavy" => Ok(UnitKind::HeavyInfantry),
+        other => Err(format!(
+            "unknown unit kind '{other}' (use infantry, scout, or heavy_infantry)"
+        )),
+    }
+}
+
+fn synthetic_state(view: &PlayerView) -> GameState {
+    let units: HashMap<Uuid, Unit> = view.units.iter().map(|u| (u.id, u.clone())).collect();
+    let buildings: HashMap<Uuid, Building> = view
+        .buildings
+        .iter()
+        .map(|rb| (rb.building.id, rb.building.clone()))
+        .collect();
+    GameState {
+        map: view.map.clone(),
+        units,
+        buildings,
+        current_turn: view.current_turn,
+        turn_number: view.turn_number,
+        winner: view.winner,
+        last_action: view.last_action.clone(),
+        seen_buildings: HashMap::new(),
+        hq_owners: std::collections::HashSet::new(),
+        funds: HashMap::new(),
+        factories_used: std::collections::HashSet::new(),
+        map_seed: view.map_seed,
+        actions_this_turn: 0,
+        idle_streak: HashMap::new(),
+        is_draw: view.is_draw,
+    }
+}
+
+fn terrain_name(t: Terrain) -> &'static str {
+    match t {
+        Terrain::Plains => "plains",
+        Terrain::Forest => "forest",
+        Terrain::Mountain => "mountain",
+        Terrain::Sea => "sea",
+    }
+}
+
+fn terrain_glyph(t: Terrain) -> char {
+    match t {
+        Terrain::Plains => '.',
+        Terrain::Forest => '^',
+        Terrain::Mountain => 'M',
+        Terrain::Sea => '~',
+    }
+}
+
+fn unit_kind_name(k: UnitKind) -> &'static str {
+    match k {
+        UnitKind::Infantry => "infantry",
+        UnitKind::Scout => "scout",
+        UnitKind::HeavyInfantry => "heavy_infantry",
+    }
+}
+
+fn building_glyph(rb: &RememberedBuilding, me: PlayerId) -> char {
+    use agent_wars::game::BuildingKind;
+    let mine = rb.building.owner == Some(me);
+    let neutral = rb.building.owner.is_none();
+    match rb.building.kind {
+        BuildingKind::Hq => if mine { 'H' } else { 'X' },
+        BuildingKind::Factory => if mine { 'F' } else if neutral { 'f' } else { 'Y' },
+        BuildingKind::City => if mine { 'C' } else if neutral { 'c' } else { 'K' },
+    }
+}
+
+fn format_state(view: &PlayerView, me: PlayerId) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "RULES (read carefully): WIN by destroying the enemy HQ (10 HP) or by their surrender — \
+         losing all units does NOT lose the game. Each turn has a 10s wallclock budget; the server \
+         auto-ends an idle turn for you. 5 consecutive idle turns auto-surrenders on turn 6; if BOTH \
+         players idle 5 turns, the match ends in a DRAW. Cities/factories are CAPTURED by ending \
+         turn standing on them, not attacked. Per-unit movement: scout=7, infantry=3, heavy=2; \
+         forest costs 1 for scouts but 2 for infantry/heavy; mountain is 2 with a HARD CAP of one \
+         mountain entry per turn. Damage = base × (atk_hp/10) × (1 − def_stars × def_hp_ratio × 0.1). \
+         Defense stars: terrain (plains 1, forest 2, mountain 4) + building bonus when occupying \
+         (city/factory: infantry +3, others +2; HQ +4). Income at start of your turn: HQ 100g, \
+         factory 1000g, city 250g per owned. Surrender allowed from turn 4.\n\n",
+    );
+    s.push_str(&format!(
+        "Map seed: {}. Turn {}; active player: {:?}; you are {:?}.\n",
+        view.map_seed, view.turn_number, view.current_turn, me
+    ));
+    let remaining = view
+        .turn_deadline_secs
+        .saturating_sub(now_secs());
+    if view.current_turn == me {
+        s.push_str(&format!(
+            "Turn clock: {remaining}s remaining (server auto-ends at 0s).\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "Turn clock: {remaining}s on opponent's turn.\n"
+        ));
+    }
+    if let Some(w) = view.winner {
+        let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
+        s.push_str(&format!("GAME OVER — Winner: {:?} ({outcome}).\n", w));
+    }
+    if view.is_draw {
+        s.push_str("GAME OVER — DRAW (both players idled too long).\n");
+    }
+    s.push_str(&format!(
+        "Map: {} x {}. Visible tiles: {}/{}. Funds: {}g.\n\n",
+        view.map.width,
+        view.map.height,
+        view.visible_tiles.len(),
+        view.map.width * view.map.height,
+        view.funds.get(&me).copied().unwrap_or(0),
+    ));
+
+    let mine_pos: HashMap<Coord, &Unit> = view
+        .units
+        .iter()
+        .filter(|u| u.owner == me)
+        .map(|u| (u.pos, u))
+        .collect();
+    let theirs_pos: HashMap<Coord, &Unit> = view
+        .units
+        .iter()
+        .filter(|u| u.owner != me)
+        .map(|u| (u.pos, u))
+        .collect();
+    let visible: std::collections::HashSet<Coord> = view.visible_tiles.iter().copied().collect();
+    let buildings_by_pos: HashMap<Coord, &RememberedBuilding> = view
+        .buildings
+        .iter()
+        .map(|rb| (rb.building.pos, rb))
+        .collect();
+
+    s.push_str("   ");
+    for x in 0..view.map.width {
+        s.push_str(&format!("{:>2} ", x));
+    }
+    s.push('\n');
+    for y in 0..view.map.height {
+        s.push_str(&format!("{:>2} ", y));
+        for x in 0..view.map.width {
+            let pos = (x, y);
+            let glyph = if let Some(u) = mine_pos.get(&pos) {
+                if buildings_by_pos.contains_key(&pos) {
+                    building_glyph(buildings_by_pos[&pos], me)
+                } else if u.has_moved {
+                    'u'
+                } else {
+                    'U'
+                }
+            } else if let Some(rb) = buildings_by_pos.get(&pos) {
+                building_glyph(rb, me)
+            } else if !visible.contains(&pos) {
+                '?'
+            } else if theirs_pos.contains_key(&pos) {
+                'E'
+            } else {
+                view.map.terrain(pos).map(terrain_glyph).unwrap_or('?')
+            };
+            s.push_str(&format!(" {} ", glyph));
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "\nLegend: U=your unit READY, u=acted, E=enemy unit, H=your HQ, X=enemy HQ, F=your factory, \
+         Y=enemy factory, f=neutral factory, C=your city, K=enemy city, c=neutral city, \
+         .=plains, ^=forest, M=mountain, ~=sea, ?=fogged.\n"
+    );
+
+    let mut mine: Vec<&Unit> = view.units.iter().filter(|u| u.owner == me).collect();
+    let mut theirs: Vec<&Unit> = view.units.iter().filter(|u| u.owner != me).collect();
+    mine.sort_by_key(|u| (u.pos.1, u.pos.0));
+    theirs.sort_by_key(|u| (u.pos.1, u.pos.0));
+    let ready = mine.iter().filter(|u| !u.has_moved).count();
+    let acted = mine.len() - ready;
+    s.push_str(&format!(
+        "\nYour units ({}, {} READY / {} acted):\n",
+        mine.len(),
+        ready,
+        acted
+    ));
+    for u in &mine {
+        let terrain = view.map.terrain(u.pos).map(terrain_name).unwrap_or("?");
+        s.push_str(&format!(
+            "  {} {} hp={}/{} pos=[{},{}] on {}  mv={} vis={}  [{}]\n",
+            u.id,
+            unit_kind_name(u.kind),
+            u.hp,
+            UnitKind::max_hp(u.kind),
+            u.pos.0,
+            u.pos.1,
+            terrain,
+            u.kind.move_points(),
+            u.kind.vision(),
+            if u.has_moved { "ACTED" } else { "READY" },
+        ));
+    }
+    s.push_str(&format!("\nVisible enemy units ({}):\n", theirs.len()));
+    for u in &theirs {
+        let terrain = view.map.terrain(u.pos).map(terrain_name).unwrap_or("?");
+        s.push_str(&format!(
+            "  {} {} hp={}/{} pos=[{},{}] on {}  mv={} vis={}\n",
+            u.id,
+            unit_kind_name(u.kind),
+            u.hp,
+            UnitKind::max_hp(u.kind),
+            u.pos.0,
+            u.pos.1,
+            terrain,
+            u.kind.move_points(),
+            u.kind.vision(),
+        ));
+    }
+
+    let mut mine_b = Vec::new();
+    let mut enemy_b = Vec::new();
+    let mut neutral_b = Vec::new();
+    for rb in &view.buildings {
+        match rb.building.owner {
+            Some(o) if o == me => mine_b.push(rb),
+            Some(_) => enemy_b.push(rb),
+            None => neutral_b.push(rb),
+        }
+    }
+    let kind_label = |k: agent_wars::game::BuildingKind| match k {
+        agent_wars::game::BuildingKind::Hq => "HQ",
+        agent_wars::game::BuildingKind::Factory => "Factory",
+        agent_wars::game::BuildingKind::City => "City",
+    };
+    if !mine_b.is_empty() {
+        s.push_str("\nYour buildings:\n");
+        for rb in &mine_b {
+            let extra = if rb.building.kind == agent_wars::game::BuildingKind::Hq {
+                format!(" hp={}/{}", rb.building.hp, rb.building.kind.max_hp())
+            } else if rb.building.kind == agent_wars::game::BuildingKind::Factory {
+                format!(" id={}", rb.building.id)
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "  {}{} at [{},{}]\n",
+                kind_label(rb.building.kind),
+                extra,
+                rb.building.pos.0,
+                rb.building.pos.1
+            ));
+        }
+    }
+    if !enemy_b.is_empty() {
+        s.push_str("\nKnown enemy buildings:\n");
+        for rb in &enemy_b {
+            let tag = if rb.currently_visible {
+                "live"
+            } else {
+                "ghost"
+            };
+            let extra = if rb.building.kind == agent_wars::game::BuildingKind::Hq {
+                format!(" hp={}/{}", rb.building.hp, rb.building.kind.max_hp())
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "  {}{} at [{},{}] ({}, last seen turn {})\n",
+                kind_label(rb.building.kind),
+                extra,
+                rb.building.pos.0,
+                rb.building.pos.1,
+                tag,
+                rb.last_seen_turn,
+            ));
+        }
+    }
+    if !neutral_b.is_empty() {
+        s.push_str("\nKnown neutral buildings (capturable):\n");
+        for rb in &neutral_b {
+            let tag = if rb.currently_visible {
+                "live"
+            } else {
+                "ghost"
+            };
+            s.push_str(&format!(
+                "  {} at [{},{}] ({}, last seen turn {})\n",
+                kind_label(rb.building.kind),
+                rb.building.pos.0,
+                rb.building.pos.1,
+                tag,
+                rb.last_seen_turn,
+            ));
+        }
+    }
+    s
+}
+
+fn format_action_report(
+    prev: &PlayerView,
+    new: &PlayerView,
+    unit_id: Uuid,
+    to: Coord,
+    target: Option<Coord>,
+    me: PlayerId,
+) -> String {
+    let mut s = String::new();
+    let prev_unit = prev.units.iter().find(|u| u.id == unit_id).cloned();
+    let new_unit = new.units.iter().find(|u| u.id == unit_id).cloned();
+    if let Some(prev_u) = &prev_unit {
+        if prev_u.pos == to {
+            s.push_str(&format!(
+                "Unit {} stayed at [{},{}].\n",
+                unit_id, to.0, to.1
+            ));
+        } else {
+            s.push_str(&format!(
+                "Unit {} moved [{},{}] -> [{},{}].\n",
+                unit_id, prev_u.pos.0, prev_u.pos.1, to.0, to.1
+            ));
+        }
+    }
+    if let Some(target_pos) = target {
+        let prev_unit_target = prev.units.iter().find(|u| u.pos == target_pos).cloned();
+        let prev_building_target = prev
+            .buildings
+            .iter()
+            .find(|rb| rb.building.pos == target_pos)
+            .cloned();
+        if let Some(prev_t) = prev_unit_target {
+            let new_target = new.units.iter().find(|u| u.id == prev_t.id);
+            match new_target {
+                None => s.push_str(&format!(
+                    "Defender {} at [{},{}] destroyed!\n",
+                    prev_t.id, target_pos.0, target_pos.1
+                )),
+                Some(nt) => {
+                    let dmg = prev_t.hp.saturating_sub(nt.hp);
+                    s.push_str(&format!(
+                        "Dealt {} HP to {}; defender now {} HP.\n",
+                        dmg, prev_t.id, nt.hp
+                    ));
+                }
+            }
+        } else if let Some(prev_b) = prev_building_target {
+            let new_b = new
+                .buildings
+                .iter()
+                .find(|rb| rb.building.id == prev_b.building.id);
+            let kind_label = match prev_b.building.kind {
+                agent_wars::game::BuildingKind::Hq => "HQ",
+                agent_wars::game::BuildingKind::Factory => "factory",
+                agent_wars::game::BuildingKind::City => "city",
+            };
+            match new_b {
+                None => s.push_str(&format!(
+                    "Enemy {} at [{},{}] DESTROYED!\n",
+                    kind_label, target_pos.0, target_pos.1
+                )),
+                Some(nb) => {
+                    let dmg = prev_b.building.hp.saturating_sub(nb.building.hp);
+                    s.push_str(&format!(
+                        "Dealt {} HP to enemy {}; now {} HP.\n",
+                        dmg, kind_label, nb.building.hp
+                    ));
+                }
+            }
+        }
+        match (prev_unit.as_ref(), new_unit.as_ref()) {
+            (Some(p), Some(n)) => {
+                let counter = p.hp.saturating_sub(n.hp);
+                if counter > 0 {
+                    s.push_str(&format!(
+                        "Counter: took {} HP; attacker now {} HP.\n",
+                        counter, n.hp
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                s.push_str(&format!("Counter killed your unit {}!\n", unit_id));
+            }
+            _ => {}
+        }
+    }
+    if let Some(w) = new.winner {
+        let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
+        s.push_str(&format!("\nGAME OVER — Winner: {:?} ({outcome}).\n", w));
+    }
+    if new.is_draw {
+        s.push_str("\nGAME OVER — DRAW (both players idled too long).\n");
+    }
+    s
 }
 
 async fn send_result<W: AsyncWriteExt + Unpin>(
