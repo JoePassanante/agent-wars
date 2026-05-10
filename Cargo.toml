@@ -30,3 +30,4 @@ clap = { version = "4", features = ["derive"] }
 rand = { version = "0.8", features = ["small_rng"] }
 rquickjs = { version = "0.6", features = ["macro"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde_yaml = "0.9"

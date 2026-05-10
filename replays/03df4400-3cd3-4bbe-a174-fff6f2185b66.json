@@ -1,0 +1,55 @@
+{
+  "sessionId": "03df4400-3cd3-4bbe-a174-fff6f2185b66",
+  "mapSeed": 18233429428383855666,
+  "mapGeneratorVersion": 3,
+  "gameVersion": "0.1.0",
+  "startedAt": 1778390811,
+  "endedAt": 1778390911,
+  "players": {
+    "p1": "bob",
+    "p2": "alice"
+  },
+  "winner": null,
+  "events": [
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    }
+  ]
+}

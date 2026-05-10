@@ -25,7 +25,7 @@
 //!   * `log.info / warn / error` — captured per-turn, returned with
 //!     on_turn so the agent can debug script behaviour.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -95,9 +95,11 @@ enum AiCmd {
 
 struct HarnessState {
     username: String,
-    /// Set once the server matches us into a session.
-    player: OnceLock<PlayerId>,
-    session_id: OnceLock<Uuid>,
+    url: String,
+    /// Set once the server matches us into a session. RwLock so a future
+    /// requeue feature can reset it.
+    player: std::sync::RwLock<Option<PlayerId>>,
+    session_id: std::sync::RwLock<Option<Uuid>>,
     /// Cached most-recent PlayerView from the WS broadcast.
     state: Mutex<Option<PlayerView>>,
     /// Sender for the JS runtime's game commands.
@@ -108,6 +110,13 @@ struct HarnessState {
     qjs_tx: std::sync::mpsc::Sender<JsCmd>,
     /// Resolved on disk path where the script is read/written.
     script_file: PathBuf,
+    /// Workspace dir (or current dir) — workflow.yaml lives here.
+    workspace_dir: PathBuf,
+    /// Outgoing WS sink. None until `join_queue` is called.
+    out_cmd_tx: tokio::sync::RwLock<Option<mpsc::Sender<ClientMsg>>>,
+    /// OpenRouter API key, captured at startup so spawn_sub_agent and
+    /// the JS subAgent.ask binding both have access without env lookups.
+    openrouter_key: Option<String>,
 }
 
 impl HarnessState {
@@ -130,6 +139,13 @@ enum JsCmd {
     OnTurn {
         context: serde_json::Value,
         ack: std::sync::mpsc::Sender<Result<TurnResult, String>>,
+    },
+    ConfigureSandbox {
+        /// Empty list ⇒ default-all. Otherwise: each entry is a global path
+        /// like "game.act", "subAgent.ask", "log.info". Top-level objects
+        /// are created if any of their members are listed.
+        allowed: Vec<String>,
+        ack: std::sync::mpsc::Sender<Result<(), String>>,
     },
 }
 
@@ -195,75 +211,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (game_tx, mut game_rx) = mpsc::channel::<GameCmd>(64);
     let (ai_tx, mut ai_rx) = mpsc::channel::<AiCmd>(32);
     let (qjs_tx, qjs_rx) = std::sync::mpsc::channel::<JsCmd>();
-
-    // ---- WebSocket setup (mirrors mcp.rs) -------------------------------
-    let (ws_stream, _) = connect_async(&args.url).await?;
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-    let (out_cmd_tx, mut out_cmd_rx) = mpsc::channel::<ClientMsg>(32);
     let (events_tx, _) = broadcast::channel::<ServerMsg>(64);
+
+    // Resolve workspace dir for the workflow.yaml lookup.
+    let workspace_dir = args
+        .agent_workspace
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let state = Arc::new(HarnessState {
         username: username.clone(),
-        player: OnceLock::new(),
-        session_id: OnceLock::new(),
+        url: args.url.clone(),
+        player: std::sync::RwLock::new(None),
+        session_id: std::sync::RwLock::new(None),
         state: Mutex::new(None),
         game_tx: game_tx.clone(),
         ai_tx: ai_tx.clone(),
         qjs_tx: qjs_tx.clone(),
         script_file,
+        workspace_dir,
+        out_cmd_tx: tokio::sync::RwLock::new(None),
+        openrouter_key: openrouter_key.clone(),
     });
 
-    // Reader: drains WS into events broadcast + state cache.
-    let reader_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        while let Some(msg) = ws_rx.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[WS<-] read error: {e}");
-                    break;
-                }
-            };
-            let WsMessage::Text(t) = msg else { continue };
-            let server_msg: ServerMsg = match serde_json::from_str(&t) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("[WS<-] bad server msg: {e}");
-                    continue;
-                }
-            };
-            log_server_msg(&server_msg);
-            if let ServerMsg::State(view) = &server_msg {
-                *reader_state.state.lock().await = Some(view.clone());
-            }
-            // events broadcast — used by GameCmd::Send awaits.
-            let _ = events_tx_handle().send(server_msg);
-        }
-        eprintln!("[WS<-] reader exiting (connection closed)");
-    });
-
-    // Writer: drains out_cmd_rx into the WS sink.
-    tokio::spawn(async move {
-        while let Some(cmd) = out_cmd_rx.recv().await {
-            log_client_msg(&cmd);
-            let s = match serde_json::to_string(&cmd) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if ws_tx.send(WsMessage::Text(s)).await.is_err() {
-                eprintln!("[WS->] sink closed; writer exiting");
-                break;
-            }
-        }
-    });
-
-    // Stash events_tx in a OnceLock so the reader closure can reach it
-    // without taking ownership at spawn time.
+    // Stash events_tx in a OnceLock so reader spawns can reach it whenever
+    // join_queue establishes a fresh WS connection.
     EVENTS_TX.set(events_tx).expect("events_tx initialized once");
 
     // GameCmd dispatcher: turn JS-thread requests into WS sends + waits.
+    // The dispatcher itself is connection-agnostic — it consults
+    // state.out_cmd_tx every time. Before join_queue: returns "not
+    // connected" errors. After: forwards normally.
     let dispatch_state = Arc::clone(&state);
-    let dispatch_out_tx = out_cmd_tx.clone();
     tokio::spawn(async move {
         while let Some(cmd) = game_rx.recv().await {
             match cmd {
@@ -272,12 +251,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = ack.send(snapshot);
                 }
                 GameCmd::Send { msg, ack } => {
+                    let tx = dispatch_state.out_cmd_tx.read().await.clone();
+                    let Some(tx) = tx else {
+                        let _ = ack.send(Err(
+                            "not connected to game — call join_queue first".into(),
+                        ));
+                        continue;
+                    };
                     let mut events = events_tx_handle().subscribe();
-                    if dispatch_out_tx.send(msg).await.is_err() {
+                    if tx.send(msg).await.is_err() {
                         let _ = ack.send(Err("writer task dead".into()));
                         continue;
                     }
-                    // Wait for the next post-handshake response (Error or State).
                     let resp = wait_response(&mut events).await;
                     let _ = ack.send(resp);
                 }
@@ -326,17 +311,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ---- Hello → Queue → Matched ---------------------------------------
-    let mut bootstrap = events_tx_handle().subscribe();
-    out_cmd_tx
-        .send(ClientMsg::Hello {
-            username: username.clone(),
-            intent: ClientIntent::Play,
-        })
-        .await?;
-    handshake(&state, &mut bootstrap).await?;
+    // Apply workflow.yaml's sandbox.allowed_globals if present so the
+    // agent's persisted gating loads automatically.
+    let workflow_path = state.workspace_dir.join("workflow.yaml");
+    let workflow = load_workflow(&workflow_path);
+    if let Some(wf) = &workflow {
+        if let Some(sandbox) = &wf.sandbox {
+            if let Some(globals) = &sandbox.allowed_globals {
+                eprintln!(
+                    "[HARNESS] applying workflow.yaml sandbox.allowed_globals: {globals:?}"
+                );
+                let (tx, rx) = std::sync::mpsc::channel();
+                let _ = state.qjs_tx.send(JsCmd::ConfigureSandbox {
+                    allowed: globals.clone(),
+                    ack: tx,
+                });
+                let _ = rx.recv_timeout(Duration::from_secs(5));
+            }
+        }
+    }
 
-    eprintln!("agent-wars-harness ready (player={:?})", state.player.get());
+    eprintln!(
+        "[HARNESS] ready (NOT yet connected to game). Use the `join_queue` MCP tool when the agent is ready to play."
+    );
 
     // ---- QuickJS thread ------------------------------------------------
     let qjs_state = Arc::clone(&state);
@@ -397,14 +394,14 @@ async fn handshake(
             }
             Ok(Ok(ServerMsg::Matched { session_id, role })) => {
                 eprintln!("matched into session {session_id} as {role:?}");
-                let _ = state.player.set(role);
-                let _ = state.session_id.set(session_id);
+                *state.player.write().unwrap() = Some(role);
+                *state.session_id.write().unwrap() = Some(session_id);
                 deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             }
             Ok(Ok(ServerMsg::Reconnected { session_id, role })) => {
                 eprintln!("reconnected to session {session_id} as {role:?}");
-                let _ = state.player.set(role);
-                let _ = state.session_id.set(session_id);
+                *state.player.write().unwrap() = Some(role);
+                *state.session_id.write().unwrap() = Some(session_id);
             }
             Ok(Ok(ServerMsg::Spectating { session_id })) => {
                 return Err(format!(
@@ -420,6 +417,80 @@ async fn handshake(
             Err(_) => return Err("timed out waiting for matchmaking".into()),
         }
     }
+    Ok(())
+}
+
+/// Open a fresh WS connection to the game server, spawn reader/writer tasks
+/// against it, send Hello + intent: Play, and walk the matchmaking handshake.
+/// Mutates state.out_cmd_tx, state.player, state.session_id on success.
+async fn connect_to_game(state: &Arc<HarnessState>) -> Result<(), String> {
+    if state.out_cmd_tx.read().await.is_some() {
+        return Err("already connected — duplicate join_queue".into());
+    }
+    eprintln!("[HARNESS] connecting to game at {}", state.url);
+    let (ws_stream, _) = connect_async(&state.url)
+        .await
+        .map_err(|e| format!("connect_async failed: {e}"))?;
+    let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+    let (out_tx, mut out_rx) = mpsc::channel::<ClientMsg>(32);
+    *state.out_cmd_tx.write().await = Some(out_tx.clone());
+
+    // Reader: drains WS into events broadcast + state cache.
+    let reader_state = Arc::clone(state);
+    tokio::spawn(async move {
+        while let Some(msg) = ws_rx.next().await {
+            let msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[WS<-] read error: {e}");
+                    break;
+                }
+            };
+            let WsMessage::Text(t) = msg else { continue };
+            let server_msg: ServerMsg = match serde_json::from_str(&t) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("[WS<-] bad server msg: {e}");
+                    continue;
+                }
+            };
+            log_server_msg(&server_msg);
+            if let ServerMsg::State(view) = &server_msg {
+                *reader_state.state.lock().await = Some(view.clone());
+            }
+            let _ = events_tx_handle().send(server_msg);
+        }
+        eprintln!("[WS<-] reader exiting (connection closed)");
+    });
+
+    // Writer: drains out_rx → ws sink.
+    tokio::spawn(async move {
+        while let Some(cmd) = out_rx.recv().await {
+            log_client_msg(&cmd);
+            let s = match serde_json::to_string(&cmd) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if ws_tx.send(WsMessage::Text(s)).await.is_err() {
+                eprintln!("[WS->] sink closed; writer exiting");
+                break;
+            }
+        }
+    });
+
+    // Send Hello + walk handshake.
+    let mut bootstrap = events_tx_handle().subscribe();
+    out_tx
+        .send(ClientMsg::Hello {
+            username: state.username.clone(),
+            intent: ClientIntent::Play,
+        })
+        .await
+        .map_err(|_| "writer task dead before Hello".to_string())?;
+    handshake(state, &mut bootstrap)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -501,206 +572,235 @@ fn quickjs_main(
     let log_buffer: Arc<std::sync::Mutex<Vec<LogLine>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    // Install globals once.
-    let install_result: Result<(), String> = context.with(|ctx| -> Result<(), String> {
-        let globals = ctx.globals();
-
-        // ---- log namespace ----
-        let log_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
-        for (level_name, level_owned) in [
-            ("info", "info"),
-            ("warn", "warn"),
-            ("error", "error"),
-        ] {
-            let buf = log_buffer.clone();
-            let level_str = level_owned.to_string();
-            let f = Function::new(ctx.clone(), move |msg: rquickjs::Value| {
-                let s = stringify_value(&msg);
-                eprintln!("[JS] {level_str}: {s}");
-                buf.lock()
-                    .unwrap()
-                    .push(LogLine { level: level_str.clone(), message: s });
-            })
-            .map_err(|e| e.to_string())?;
-            log_obj.set(level_name, f).map_err(|e| e.to_string())?;
-        }
-        globals.set("log", log_obj).map_err(|e| e.to_string())?;
-
-        // ---- game namespace ----
-        let game_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
-
-        // game.getState(): returns the cached PlayerView as a JSON STRING.
-        // Scripts call JSON.parse(game.getState()) themselves — keeps the
-        // binding side ctx-free.
-        {
-            let game_tx = game_tx.clone();
-            let f = Function::new(ctx.clone(), move || -> String {
-                let (tx, rx) = oneshot::channel();
-                if game_tx.blocking_send(GameCmd::Snapshot { ack: tx }).is_err() {
-                    return "{}".into();
-                }
-                match rx.blocking_recv() {
-                    Ok(Some(view)) => serde_json::to_string(&view).unwrap_or_else(|_| "{}".into()),
-                    _ => "{}".into(),
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            game_obj.set("getState", f).map_err(|e| e.to_string())?;
-        }
-
-        // game.act(unitId, [tx,ty], [targetX,targetY] | null)
-        {
-            let game_tx = game_tx.clone();
-            let f = Function::new(ctx.clone(), move |unit_id: String, to: rquickjs::Value, target: rquickjs::Value| -> rquickjs::Result<String> {
-                let to_coord = parse_coord_js(&to).map_err(|e| rquickjs::Error::Exception)?;
-                let attack = if target.is_undefined() || target.is_null() {
-                    None
-                } else {
-                    Some(parse_coord_js(&target).map_err(|e| rquickjs::Error::Exception)?)
-                };
-                let unit_uuid = unit_id.parse::<Uuid>().map_err(|_| rquickjs::Error::Exception)?;
-                let (tx, rx) = oneshot::channel();
-                game_tx
-                    .blocking_send(GameCmd::Send {
-                        msg: ClientMsg::Move { unit_id: unit_uuid, to: to_coord, attack },
-                        ack: tx,
-                    })
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                match rx.blocking_recv() {
-                    Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
-                    Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
-                    Ok(Ok(_)) => Ok("unexpected".into()),
-                    Ok(Err(e)) => Ok(format!("error: {e}")),
-                    Err(_) => Ok("error: ack channel closed".into()),
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            game_obj.set("act", f).map_err(|e| e.to_string())?;
-        }
-
-        // game.endTurn()
-        {
-            let game_tx = game_tx.clone();
-            let f = Function::new(ctx.clone(), move || -> rquickjs::Result<String> {
-                let (tx, rx) = oneshot::channel();
-                game_tx
-                    .blocking_send(GameCmd::Send { msg: ClientMsg::EndTurn, ack: tx })
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                match rx.blocking_recv() {
-                    Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
-                    Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
-                    _ => Ok("unexpected".into()),
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            game_obj.set("endTurn", f).map_err(|e| e.to_string())?;
-        }
-
-        // game.buyUnit(factoryId, kindString)
-        {
-            let game_tx = game_tx.clone();
-            let f = Function::new(ctx.clone(), move |factory_id: String, kind: String| -> rquickjs::Result<String> {
-                let factory_uuid = factory_id.parse::<Uuid>().map_err(|_| rquickjs::Error::Exception)?;
-                let unit_kind = match kind.as_str() {
-                    "scout" => UnitKind::Scout,
-                    "infantry" => UnitKind::Infantry,
-                    "heavy_infantry" | "heavyInfantry" | "heavy" => UnitKind::HeavyInfantry,
-                    _ => return Ok(format!("error: unknown kind {kind}")),
-                };
-                let (tx, rx) = oneshot::channel();
-                game_tx
-                    .blocking_send(GameCmd::Send {
-                        msg: ClientMsg::BuyUnit { factory_id: factory_uuid, kind: unit_kind },
-                        ack: tx,
-                    })
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                match rx.blocking_recv() {
-                    Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
-                    Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
-                    _ => Ok("unexpected".into()),
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            game_obj.set("buyUnit", f).map_err(|e| e.to_string())?;
-        }
-
-        // game.surrender()
-        {
-            let game_tx = game_tx.clone();
-            let f = Function::new(ctx.clone(), move || -> rquickjs::Result<String> {
-                let (tx, rx) = oneshot::channel();
-                game_tx
-                    .blocking_send(GameCmd::Send { msg: ClientMsg::Surrender, ack: tx })
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                match rx.blocking_recv() {
-                    Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
-                    Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
-                    _ => Ok("unexpected".into()),
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            game_obj.set("surrender", f).map_err(|e| e.to_string())?;
-        }
-
-        // game.playTurn(actions[]) — single round-trip batch.
-        {
-            let game_tx = game_tx.clone();
-            let f = Function::new(ctx.clone(), move |actions_val: rquickjs::Value| -> rquickjs::Result<String> {
-                let actions = parse_actions(&actions_val)
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                let (tx, rx) = oneshot::channel();
-                game_tx
-                    .blocking_send(GameCmd::Send {
-                        msg: ClientMsg::PlayTurn { actions },
-                        ack: tx,
-                    })
-                    .map_err(|_| rquickjs::Error::Exception)?;
-                match rx.blocking_recv() {
-                    Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
-                    Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
-                    _ => Ok("unexpected".into()),
-                }
-            })
-            .map_err(|e| e.to_string())?;
-            game_obj.set("playTurn", f).map_err(|e| e.to_string())?;
-        }
-
-        // Identity hint so the script knows which player it is.
-        if let Some(p) = state.player.get() {
-            let role = match p {
-                PlayerId::P1 => "p1",
-                PlayerId::P2 => "p2",
-            };
-            game_obj.set("you", role).map_err(|e| e.to_string())?;
-        }
-
-        globals.set("game", game_obj).map_err(|e| e.to_string())?;
-
-        // ---- subAgent namespace ----
-        let agent_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
-        let ai_tx_inner = ai_tx.clone();
-        let f = Function::new(ctx.clone(), move |prompt: String, opts: rquickjs::Value| -> rquickjs::Result<String> {
-            let model = opts
-                .as_object()
-                .and_then(|o| o.get::<_, String>("model").ok())
-                .unwrap_or_else(|| "anthropic/claude-haiku-4-5".to_string());
-            let (tx, rx) = oneshot::channel();
-            ai_tx_inner
-                .blocking_send(AiCmd::Ask { prompt, model, ack: tx })
-                .map_err(|_| rquickjs::Error::Exception)?;
-            match rx.blocking_recv() {
-                Ok(Ok(s)) => Ok(s),
-                Ok(Err(e)) => Ok(format!("error: {e}")),
-                Err(_) => Ok("error: ai channel closed".into()),
+    // (Re)install all JS globals, gated by an optional allowlist. An empty
+    // allowlist exposes everything. Otherwise an entry like "game" enables
+    // all members of the game namespace, and "game.act" enables only that
+    // method. Called once at startup (allowed=empty) and again whenever
+    // configure_sandbox arrives.
+    let do_install = |allowed: HashSet<String>| -> Result<(), String> {
+        let want = |path: &str| -> bool {
+            if allowed.is_empty() {
+                return true;
             }
-        })
-        .map_err(|e| e.to_string())?;
-        agent_obj.set("ask", f).map_err(|e| e.to_string())?;
-        globals.set("subAgent", agent_obj).map_err(|e| e.to_string())?;
+            if allowed.contains(path) {
+                return true;
+            }
+            if let Some((parent, _)) = path.rsplit_once('.') {
+                if allowed.contains(parent) {
+                    return true;
+                }
+            }
+            false
+        };
+        context.with(|ctx| -> Result<(), String> {
+            let globals = ctx.globals();
 
-        Ok(())
-    });
-    if let Err(e) = install_result {
+            // ---- log namespace ----
+            if want("log") || want("log.info") || want("log.warn") || want("log.error") {
+                let log_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+                for (level_name, level_owned) in [
+                    ("info", "info"),
+                    ("warn", "warn"),
+                    ("error", "error"),
+                ] {
+                    let path = format!("log.{level_name}");
+                    if !want(&path) {
+                        continue;
+                    }
+                    let buf = log_buffer.clone();
+                    let level_str = level_owned.to_string();
+                    let f = Function::new(ctx.clone(), move |msg: rquickjs::Value| {
+                        let s = stringify_value(&msg);
+                        eprintln!("[JS] {level_str}: {s}");
+                        buf.lock().unwrap().push(LogLine {
+                            level: level_str.clone(),
+                            message: s,
+                        });
+                    })
+                    .map_err(|e| e.to_string())?;
+                    log_obj.set(level_name, f).map_err(|e| e.to_string())?;
+                }
+                globals.set("log", log_obj).map_err(|e| e.to_string())?;
+            } else {
+                let _ = globals.remove("log");
+            }
+
+            // ---- game namespace ----
+            let game_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+            let _want_game_root = want("game");
+
+            // game.getState
+            if want("game.getState") {
+                let game_tx = game_tx.clone();
+                let f = Function::new(ctx.clone(), move || -> String {
+                    let (tx, rx) = oneshot::channel();
+                    if game_tx.blocking_send(GameCmd::Snapshot { ack: tx }).is_err() {
+                        return "{}".into();
+                    }
+                    match rx.blocking_recv() {
+                        Ok(Some(view)) => serde_json::to_string(&view).unwrap_or_else(|_| "{}".into()),
+                        _ => "{}".into(),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                game_obj.set("getState", f).map_err(|e| e.to_string())?;
+            }
+
+            if want("game.act") {
+                let game_tx = game_tx.clone();
+                let f = Function::new(ctx.clone(), move |unit_id: String, to: rquickjs::Value, target: rquickjs::Value| -> rquickjs::Result<String> {
+                    let to_coord = parse_coord_js(&to).map_err(|_| rquickjs::Error::Exception)?;
+                    let attack = if target.is_undefined() || target.is_null() {
+                        None
+                    } else {
+                        Some(parse_coord_js(&target).map_err(|_| rquickjs::Error::Exception)?)
+                    };
+                    let unit_uuid = unit_id.parse::<Uuid>().map_err(|_| rquickjs::Error::Exception)?;
+                    let (tx, rx) = oneshot::channel();
+                    game_tx
+                        .blocking_send(GameCmd::Send {
+                            msg: ClientMsg::Move { unit_id: unit_uuid, to: to_coord, attack },
+                            ack: tx,
+                        })
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    match rx.blocking_recv() {
+                        Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
+                        Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
+                        Ok(Ok(_)) => Ok("unexpected".into()),
+                        Ok(Err(e)) => Ok(format!("error: {e}")),
+                        Err(_) => Ok("error: ack channel closed".into()),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                game_obj.set("act", f).map_err(|e| e.to_string())?;
+            }
+
+            if want("game.endTurn") {
+                let game_tx = game_tx.clone();
+                let f = Function::new(ctx.clone(), move || -> rquickjs::Result<String> {
+                    let (tx, rx) = oneshot::channel();
+                    game_tx
+                        .blocking_send(GameCmd::Send { msg: ClientMsg::EndTurn, ack: tx })
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    match rx.blocking_recv() {
+                        Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
+                        Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
+                        _ => Ok("unexpected".into()),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                game_obj.set("endTurn", f).map_err(|e| e.to_string())?;
+            }
+
+            if want("game.buyUnit") {
+                let game_tx = game_tx.clone();
+                let f = Function::new(ctx.clone(), move |factory_id: String, kind: String| -> rquickjs::Result<String> {
+                    let factory_uuid = factory_id.parse::<Uuid>().map_err(|_| rquickjs::Error::Exception)?;
+                    let unit_kind = match kind.as_str() {
+                        "scout" => UnitKind::Scout,
+                        "infantry" => UnitKind::Infantry,
+                        "heavy_infantry" | "heavyInfantry" | "heavy" => UnitKind::HeavyInfantry,
+                        _ => return Ok(format!("error: unknown kind {kind}")),
+                    };
+                    let (tx, rx) = oneshot::channel();
+                    game_tx
+                        .blocking_send(GameCmd::Send {
+                            msg: ClientMsg::BuyUnit { factory_id: factory_uuid, kind: unit_kind },
+                            ack: tx,
+                        })
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    match rx.blocking_recv() {
+                        Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
+                        Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
+                        _ => Ok("unexpected".into()),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                game_obj.set("buyUnit", f).map_err(|e| e.to_string())?;
+            }
+
+            if want("game.surrender") {
+                let game_tx = game_tx.clone();
+                let f = Function::new(ctx.clone(), move || -> rquickjs::Result<String> {
+                    let (tx, rx) = oneshot::channel();
+                    game_tx
+                        .blocking_send(GameCmd::Send { msg: ClientMsg::Surrender, ack: tx })
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    match rx.blocking_recv() {
+                        Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
+                        Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
+                        _ => Ok("unexpected".into()),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                game_obj.set("surrender", f).map_err(|e| e.to_string())?;
+            }
+
+            if want("game.playTurn") {
+                let game_tx = game_tx.clone();
+                let f = Function::new(ctx.clone(), move |actions_val: rquickjs::Value| -> rquickjs::Result<String> {
+                    let actions = parse_actions(&actions_val)
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    let (tx, rx) = oneshot::channel();
+                    game_tx
+                        .blocking_send(GameCmd::Send {
+                            msg: ClientMsg::PlayTurn { actions },
+                            ack: tx,
+                        })
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    match rx.blocking_recv() {
+                        Ok(Ok(ServerMsg::State(_))) => Ok("ok".into()),
+                        Ok(Ok(ServerMsg::Error { message })) => Ok(format!("error: {message}")),
+                        _ => Ok("unexpected".into()),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                game_obj.set("playTurn", f).map_err(|e| e.to_string())?;
+            }
+
+            // Identity hint — re-read state.player on every (re)install so a
+            // configure_sandbox after join_queue picks up the role.
+            if let Some(p) = *state.player.read().unwrap() {
+                let role = match p {
+                    PlayerId::P1 => "p1",
+                    PlayerId::P2 => "p2",
+                };
+                game_obj.set("you", role).map_err(|e| e.to_string())?;
+            }
+
+            globals.set("game", game_obj).map_err(|e| e.to_string())?;
+
+            // ---- subAgent namespace ----
+            if want("subAgent.ask") {
+                let agent_obj = Object::new(ctx.clone()).map_err(|e| e.to_string())?;
+                let ai_tx_inner = ai_tx.clone();
+                let f = Function::new(ctx.clone(), move |prompt: String, opts: rquickjs::Value| -> rquickjs::Result<String> {
+                    let model = opts
+                        .as_object()
+                        .and_then(|o| o.get::<_, String>("model").ok())
+                        .unwrap_or_else(|| "anthropic/claude-haiku-4-5".to_string());
+                    let (tx, rx) = oneshot::channel();
+                    ai_tx_inner
+                        .blocking_send(AiCmd::Ask { prompt, model, ack: tx })
+                        .map_err(|_| rquickjs::Error::Exception)?;
+                    match rx.blocking_recv() {
+                        Ok(Ok(s)) => Ok(s),
+                        Ok(Err(e)) => Ok(format!("error: {e}")),
+                        Err(_) => Ok("error: ai channel closed".into()),
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+                agent_obj.set("ask", f).map_err(|e| e.to_string())?;
+                globals.set("subAgent", agent_obj).map_err(|e| e.to_string())?;
+            } else {
+                let _ = globals.remove("subAgent");
+            }
+
+            Ok(())
+        })
+    };
+
+    if let Err(e) = do_install(HashSet::new()) {
         eprintln!("failed to install JS globals: {e}");
         return;
     }
@@ -757,6 +857,11 @@ fn quickjs_main(
                     })
                 });
                 let _ = ack.send(result);
+            }
+            JsCmd::ConfigureSandbox { allowed, ack } => {
+                eprintln!("[JS] configure_sandbox: {} entries", allowed.len());
+                let set: HashSet<String> = allowed.into_iter().collect();
+                let _ = ack.send(do_install(set));
             }
         }
     }
@@ -1076,6 +1181,66 @@ fn list_tools() -> Vec<Value> {
             "description": "Return the harness's most recent cached PlayerView (no WS call). Same shape as the game MCP's get_state but without the rules block — this tool is for sanity-checking what the script will see.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
+        // ---- Lifecycle / preparation -----
+        json!({
+            "name": "join_queue",
+            "description": "Connect to the game server and queue this player for matchmaking. The harness DOES NOT auto-queue at startup — call this only when your script and any sub-agent setup are ready to fight. Once connected, the server matches you against another queued player and the rest of the game-control tools (act, play_turn, etc.) start working.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "configure_sandbox",
+            "description": "Restrict which globals the QuickJS script can see. Pass a list of allowed-global paths like ['game.act', 'game.getState', 'subAgent.ask', 'log.info']. The script's runtime is rebuilt with only those exposed; everything else is unset. Pass an empty list (or omit) to reset to the default of ALL globals exposed. Useful when you want to gate what your scripted sub-harness can do.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "allowed": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "get_workflow",
+            "description": "Read <workspace>/workflow.yaml as a string. Returns empty string if not present. Schema (all optional):\nsandbox:\n  allowed_globals: [list of paths]\nsub_agents:\n  <name>:\n    model: <openrouter model id>\n    system: <system prompt>\n    tools: [list of tool names]\nThe harness loads this file at startup and re-loads on set_workflow.",
+            "inputSchema": { "type": "object", "properties": {}, "required": [] }
+        }),
+        json!({
+            "name": "set_workflow",
+            "description": "Write workflow.yaml to the agent's workspace. Replaces any existing file. Triggers a reload so configure_sandbox / sub-agent presets take effect immediately.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "yaml": { "type": "string" }
+                },
+                "required": ["yaml"]
+            }
+        }),
+        json!({
+            "name": "spawn_sub_agent",
+            "description": "Run a smaller LLM with tool-call access via OpenRouter. The sub-agent receives `prompt`, runs a tool-use loop using only `allowedTools` (each tool is a name from this harness's tool surface), and returns its final assistant message. Use this for the 'mid-case' workflow branch — heavy enough to need an LLM but cheaper than waking the meta-agent. Default model: anthropic/claude-haiku-4-5. Caps at 8 iterations.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "model": { "type": "string", "description": "OpenRouter model id; default anthropic/claude-haiku-4-5" },
+                    "system": { "type": "string", "description": "Optional system prompt." },
+                    "allowedTools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Subset of this harness's tool names the sub-agent may call. Empty = no tools (just answer)."
+                    },
+                    "maxIterations": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 32,
+                        "description": "Max chat turns before bailing. Default 8."
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }),
         json!({
             "name": "wait_for_turn",
             "description": "Block until it's THIS player's turn (or the game ends), then return. Use this between rounds — the canonical loop is `wait_for_turn → on_turn / act / play_turn → wait_for_turn → ...`. Soft `timeoutSeconds` budget (default 50) so the call returns even if no progress happens; just call again if you get back a 'still waiting' response.",
@@ -1192,6 +1357,12 @@ async fn dispatch_tool(
     eprintln!("[TOOL] → {name}");
     let started = std::time::Instant::now();
     let result = match name {
+        // Lifecycle.
+        "join_queue" => handle_join_queue(state).await,
+        "configure_sandbox" => handle_configure_sandbox(state, args).await,
+        "get_workflow" => handle_get_workflow(state).await,
+        "set_workflow" => handle_set_workflow(state, args).await,
+        "spawn_sub_agent" => handle_spawn_sub_agent(state, args).await,
         // Script / sandbox tools.
         "set_script" => handle_set_script(state, args).await,
         "get_script" => handle_get_script(state).await,
@@ -1309,11 +1480,7 @@ async fn handle_wait_for_turn(
         .and_then(|v| v.as_u64())
         .unwrap_or(50)
         .clamp(1, 120);
-    let me = state
-        .player
-        .get()
-        .copied()
-        .ok_or("harness not yet matched into a session")?;
+    let me = current_player(state)?;
 
     // Subscribe BEFORE checking state to avoid missing the transition.
     let mut events = events_tx_handle().subscribe();
@@ -1384,12 +1551,248 @@ async fn handle_wait_for_turn(
 
 async fn handle_get_state(state: &Arc<HarnessState>) -> Result<String, String> {
     let view = state.state.lock().await.clone().ok_or("no state yet")?;
-    let me = state
-        .player
-        .get()
-        .copied()
-        .ok_or("harness not yet matched into a session")?;
+    let me = current_player(state)?;
     Ok(format_state(&view, me))
+}
+
+async fn handle_join_queue(state: &Arc<HarnessState>) -> Result<String, String> {
+    connect_to_game(state).await?;
+    let player = current_player(state)?;
+    let session_id = state
+        .session_id
+        .read()
+        .unwrap()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "?".into());
+    Ok(format!(
+        "Matched! You are {player:?} in session {session_id}. Direct play and on_turn are now live."
+    ))
+}
+
+async fn handle_configure_sandbox(
+    state: &Arc<HarnessState>,
+    args: &Value,
+) -> Result<String, String> {
+    let allowed: Vec<String> = args
+        .get("allowed")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    state
+        .qjs_tx
+        .send(JsCmd::ConfigureSandbox {
+            allowed: allowed.clone(),
+            ack: tx,
+        })
+        .map_err(|_| "QuickJS thread dead")?;
+    rx.recv_timeout(Duration::from_secs(5))
+        .map_err(|_| "QuickJS did not respond in 5s")??;
+    Ok(if allowed.is_empty() {
+        "Sandbox reset: all globals exposed.".into()
+    } else {
+        format!(
+            "Sandbox reconfigured: only [{}] exposed.",
+            allowed.join(", ")
+        )
+    })
+}
+
+async fn handle_get_workflow(state: &Arc<HarnessState>) -> Result<String, String> {
+    let path = state.workspace_dir.join("workflow.yaml");
+    Ok(std::fs::read_to_string(&path).unwrap_or_default())
+}
+
+async fn handle_set_workflow(
+    state: &Arc<HarnessState>,
+    args: &Value,
+) -> Result<String, String> {
+    let yaml = args
+        .get("yaml")
+        .and_then(|v| v.as_str())
+        .ok_or("`yaml` (string) is required")?;
+    // Validate it parses.
+    let _: serde_yaml::Value =
+        serde_yaml::from_str(yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+    let path = state.workspace_dir.join("workflow.yaml");
+    std::fs::write(&path, yaml).map_err(|e| format!("write failed: {e}"))?;
+    Ok(format!("workflow.yaml saved at {}", path.display()))
+}
+
+#[derive(Default, serde::Deserialize)]
+struct WorkflowFile {
+    sandbox: Option<WorkflowSandbox>,
+    sub_agents: Option<HashMap<String, WorkflowSubAgent>>,
+}
+
+#[derive(serde::Deserialize)]
+struct WorkflowSandbox {
+    allowed_globals: Option<Vec<String>>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct WorkflowSubAgent {
+    model: Option<String>,
+    system: Option<String>,
+    tools: Option<Vec<String>>,
+}
+
+fn load_workflow(path: &std::path::Path) -> Option<WorkflowFile> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match serde_yaml::from_str::<WorkflowFile>(&text) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!("[HARNESS] workflow.yaml parse error: {e}");
+            None
+        }
+    }
+}
+
+async fn handle_spawn_sub_agent(
+    state: &Arc<HarnessState>,
+    args: &Value,
+) -> Result<String, String> {
+    let prompt = args
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .ok_or("prompt required")?
+        .to_string();
+    let model = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("anthropic/claude-haiku-4-5")
+        .to_string();
+    let system = args
+        .get("system")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let allowed_tools: Vec<String> = args
+        .get("allowedTools")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let max_iter = args
+        .get("maxIterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8) as usize;
+
+    let api_key = state
+        .openrouter_key
+        .as_deref()
+        .ok_or("OPENROUTER_API_KEY not set")?;
+
+    eprintln!(
+        "[SUB-AGENT] → model={model} tools={} prompt({} chars)",
+        allowed_tools.len(),
+        prompt.len()
+    );
+
+    // Build OpenAI-compatible tool definitions for whichever names the
+    // meta-agent allowed. We re-export each tool's MCP schema verbatim.
+    let all_tools = list_tools();
+    let tool_defs: Vec<Value> = all_tools
+        .iter()
+        .filter(|t| {
+            t.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| allowed_tools.iter().any(|a| a == n))
+                .unwrap_or(false)
+        })
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["inputSchema"],
+                }
+            })
+        })
+        .collect();
+
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(s) = system {
+        messages.push(json!({"role": "system", "content": s}));
+    }
+    messages.push(json!({"role": "user", "content": prompt}));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    for iter in 0..max_iter {
+        let mut body = json!({
+            "model": &model,
+            "messages": &messages,
+        });
+        if !tool_defs.is_empty() {
+            body["tools"] = Value::Array(tool_defs.clone());
+        }
+        let resp = client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .bearer_auth(api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("openrouter request: {e}"))?;
+        let status = resp.status();
+        let json: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("openrouter parse: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("openrouter http {status}: {json}"));
+        }
+        let msg = json["choices"][0]["message"].clone();
+        if msg.is_null() {
+            return Err(format!("no message in response: {json}"));
+        }
+
+        // Append assistant message verbatim so subsequent loop iterations
+        // include the right tool_call_ids.
+        messages.push(msg.clone());
+
+        let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned();
+        if let Some(calls) = tool_calls {
+            if calls.is_empty() {
+                let content = msg["content"].as_str().unwrap_or("").to_string();
+                eprintln!("[SUB-AGENT] ← final after {iter} iterations: {}", preview(&content, 120));
+                return Ok(content);
+            }
+            for tc in calls {
+                let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                let raw_args = tc["function"]["arguments"].as_str().unwrap_or("{}");
+                let parsed_args: Value =
+                    serde_json::from_str(raw_args).unwrap_or(Value::Null);
+                eprintln!(
+                    "[SUB-AGENT] tool_call → {name}({})",
+                    preview(raw_args, 120)
+                );
+                let result = match Box::pin(dispatch_tool(state, &name, &parsed_args)).await {
+                    Ok(s) => s,
+                    Err(e) => format!("Error: {e}"),
+                };
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": name,
+                    "content": result,
+                }));
+            }
+        } else {
+            // No tool calls — return the assistant text.
+            let content = msg["content"].as_str().unwrap_or("").to_string();
+            eprintln!(
+                "[SUB-AGENT] ← final after {iter} iterations: {}",
+                preview(&content, 120)
+            );
+            return Ok(content);
+        }
+    }
+    Err(format!(
+        "sub-agent exceeded max_iterations ({max_iter}) without producing a final message"
+    ))
 }
 
 // ============================================================
@@ -1414,9 +1817,9 @@ async fn send_via_dispatcher(
 fn current_player(state: &Arc<HarnessState>) -> Result<PlayerId, String> {
     state
         .player
-        .get()
-        .copied()
-        .ok_or_else(|| "harness not yet matched into a session".to_string())
+        .read()
+        .unwrap()
+        .ok_or_else(|| "harness not yet matched into a session — call join_queue first".to_string())
 }
 
 async fn cached_view(state: &Arc<HarnessState>) -> Result<PlayerView, String> {
