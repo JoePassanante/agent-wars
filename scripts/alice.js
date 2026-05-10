@@ -1,0 +1,1 @@
+function onTurn(ctx){ log.info('hello from script'); const s = JSON.parse(game.getState()); log.info('seed=' + s.mapSeed + ' your=' + s.you); return 'ran ok'; }
