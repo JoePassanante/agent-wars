@@ -37,15 +37,10 @@
         <button id="browseBtn">Watch a game</button>
       </div>
       <p id="lobbyStatus" class="lobby-status"></p>
-      <h3>Active sessions</h3>
-      <table id="sessionsTable">
-        <thead>
-          <tr><th>id</th><th>size</th><th>turn</th><th>active</th><th>units P1/P2</th><th></th></tr>
-        </thead>
-        <tbody id="sessionsBody">
-          <tr><td colspan="6" class="empty">Loading…</td></tr>
-        </tbody>
-      </table>
+      <h3>Active games</h3>
+      <div id="sessionsGrid" class="sessions-grid">
+        <p class="empty">Loading active games…</p>
+      </div>
       <p class="hint">
         Pick a username and Queue → you'll be matched once another player
         joins. Or click Watch on any active session below to spectate.

@@ -184,41 +184,68 @@ header h1 {
   margin: 8px 0;
 }
 .lobby-status.error { color: #f66; }
-#sessionsTable {
-  width: 100%;
-  font-size: 12px;
-  border-collapse: collapse;
+.sessions-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  margin-top: 8px;
 }
-#sessionsTable th, #sessionsTable td {
-  padding: 6px 10px;
-  text-align: left;
-  border-bottom: 1px solid var(--line);
-}
-#sessionsTable th {
+.sessions-grid .empty {
   color: var(--text-faint);
-  font-weight: 500;
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
+  font-style: italic;
+  font-size: 13px;
+  margin: 0;
+  grid-column: 1 / -1;
 }
-#sessionsTable code {
+.session-card {
   background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 80ms, transform 80ms;
+}
+.session-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.session-card canvas {
+  display: block;
+  width: 100%;
+  height: 140px;
+  background: #0a0c0f;
+  border-radius: 4px;
+  image-rendering: pixelated;
+}
+.session-card .meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+.session-card .meta code {
+  background: var(--bg-2);
   padding: 1px 5px;
   border-radius: 3px;
-  font-size: 11px;
+  font-size: 10px;
+  color: var(--text-faint);
 }
-#sessionsTable tr.empty td { color: var(--text-faint); font-style: italic; }
-#sessionsTable button {
+.session-card .meta .winner {
+  color: var(--accent);
+  font-weight: 500;
+}
+.session-card button {
   background: var(--bg-3);
   color: var(--text);
   border: 1px solid var(--line-2);
-  padding: 3px 10px;
-  border-radius: 3px;
+  padding: 6px 10px;
+  border-radius: 4px;
   cursor: pointer;
   font: inherit;
   font-size: 12px;
+  font-weight: 500;
 }
-#sessionsTable button:hover { border-color: var(--accent); }
+.session-card button:hover { border-color: var(--accent); background: #2c3038; }
 
 /* ----- Main game area ----- */
 main {

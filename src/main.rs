@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use agent_wars::game::{GAME_VERSION, MAP_GENERATOR_VERSION, PlayerId};
+use agent_wars::game::{
+    GAME_VERSION, MAP_GENERATOR_VERSION, Map, PlayerId, RememberedBuilding, Unit, View,
+};
 use agent_wars::lobby::{AppState, Replay};
 use agent_wars::ws;
 use axum::{
@@ -44,6 +46,7 @@ async fn main() {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SessionSummary {
     id: uuid::Uuid,
     map_seed: u64,
@@ -53,21 +56,26 @@ struct SessionSummary {
     current_turn: PlayerId,
     has_winner: bool,
     winner: Option<PlayerId>,
-    /// Number of units per side. Doesn't reveal anything an in-game spectator
-    /// couldn't already see.
     p1_units: usize,
     p2_units: usize,
     started_at_secs: u64,
+    /// Live map snapshot + unit/building positions for spectator-style
+    /// preview rendering on the lobby page. Same data a fresh spectator
+    /// would receive in a State message.
+    map: Map,
+    units: Vec<Unit>,
+    buildings: Vec<RememberedBuilding>,
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
     let lobby = state.lobby.lock().await;
     let mut out = Vec::new();
     for s in lobby.sessions.values() {
-        let g = s.game.lock().await;
+        let mut g = s.game.lock().await;
         let p1_units = g.units.values().filter(|u| u.owner == PlayerId::P1).count();
         let p2_units = g.units.values().filter(|u| u.owner == PlayerId::P2).count();
         let replay_started_at = s.replay.lock().await.started_at;
+        let view = g.view_for(View::Spectator);
         out.push(SessionSummary {
             id: s.id,
             map_seed: g.map_seed,
@@ -80,6 +88,9 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary
             p1_units,
             p2_units,
             started_at_secs: replay_started_at,
+            map: view.map,
+            units: view.units,
+            buildings: view.buildings,
         });
     }
     Json(out)

@@ -43,7 +43,6 @@ const els = {
   queueBtn: document.getElementById("queueBtn"),
   browseBtn: document.getElementById("browseBtn"),
   lobbyStatus: document.getElementById("lobbyStatus"),
-  sessionsBody: document.getElementById("sessionsBody"),
 };
 const ctx = els.canvas.getContext("2d");
 
@@ -71,23 +70,39 @@ function lobbyStatus(text, cls = "") {
 }
 
 async function refreshSessions() {
+  const grid = document.getElementById("sessionsGrid");
+  if (!grid) return;
   try {
     const resp = await fetch("/api/sessions");
     const sessions = await resp.json();
     if (!sessions.length) {
-      els.sessionsBody.innerHTML = '<tr class="empty"><td colspan="6">No active sessions yet.</td></tr>';
+      grid.innerHTML = '<p class="empty">No live games right now. Pick a username and Queue to start one.</p>';
       return;
     }
-    els.sessionsBody.innerHTML = sessions.map((s) => `
-      <tr>
-        <td><code>${shortId(s.id)}</code></td>
-        <td>${s.mapWidth}×${s.mapHeight}</td>
-        <td>${s.turnNumber}</td>
-        <td>${s.currentTurn}${s.hasWinner ? " ✓" : ""}</td>
-        <td>${s.p1Units}/${s.p2Units}</td>
-        <td><button data-watch="${s.id}">Watch</button></td>
-      </tr>`).join("");
-    els.sessionsBody.querySelectorAll("button[data-watch]").forEach((b) => {
+    grid.innerHTML = sessions
+      .map(
+        (s) => `
+        <div class="session-card">
+          <canvas data-preview="${s.id}" width="200" height="140"></canvas>
+          <div class="meta">
+            <span><code>${shortId(s.id)}</code> · ${s.mapWidth}×${s.mapHeight}</span>
+            <span>turn ${s.turnNumber}</span>
+          </div>
+          <div class="meta">
+            <span>${labelPlayer(s.currentTurn)}'s turn</span>
+            <span>units P1 ${s.p1Units} · P2 ${s.p2Units}</span>
+          </div>
+          ${s.hasWinner ? `<div class="meta"><span class="winner">${labelPlayer(s.winner)} won</span></div>` : ""}
+          <button data-watch="${s.id}">Watch live</button>
+        </div>`,
+      )
+      .join("");
+    // Render the per-card preview canvases.
+    for (const s of sessions) {
+      const c = grid.querySelector(`canvas[data-preview="${s.id}"]`);
+      if (c) renderPreview(c, s);
+    }
+    grid.querySelectorAll("button[data-watch]").forEach((b) => {
       b.addEventListener("click", () => {
         const username = currentUsername();
         if (!username) return;
@@ -95,7 +110,76 @@ async function refreshSessions() {
       });
     });
   } catch (e) {
-    els.sessionsBody.innerHTML = `<tr class="empty"><td colspan="6">Failed to load sessions: ${e}</td></tr>`;
+    grid.innerHTML = `<p class="empty">Failed to load sessions: ${e}</p>`;
+  }
+}
+
+// Render a small terrain + units snapshot onto a session card's canvas.
+// Tiny tile size — drop the per-tile decorations and just paint the colors,
+// then dot in units and building positions in owner colors.
+function renderPreview(canvas, s) {
+  const map = s.map;
+  if (!map) return;
+  const pctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 200;
+  const cssH = canvas.clientHeight || 140;
+  // Fit map into the card area while preserving aspect.
+  const tile = Math.max(2, Math.floor(Math.min(cssW / map.width, cssH / map.height)));
+  const w = tile * map.width;
+  const h = tile * map.height;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + "px";
+  canvas.style.height = h + "px";
+  pctx.scale(dpr, dpr);
+
+  // Background.
+  pctx.fillStyle = "#0a0c0f";
+  pctx.fillRect(0, 0, w, h);
+  // Tiles (colors only, no decoration — too small).
+  for (let y = 0; y < map.height; y++) {
+    for (let x = 0; x < map.width; x++) {
+      const t = map.tiles[y * map.width + x];
+      pctx.fillStyle = TERRAIN_COLORS[t] || "#222";
+      pctx.fillRect(x * tile, y * tile, tile, tile);
+    }
+  }
+  // Buildings as squares in owner color.
+  for (const b of s.buildings || []) {
+    const ownerColor = b.owner ? PLAYER_COLORS[b.owner] : NEUTRAL_COLOR;
+    pctx.fillStyle = ownerColor;
+    const inset = Math.max(0.5, tile * 0.2);
+    pctx.fillRect(
+      b.pos[0] * tile + inset,
+      b.pos[1] * tile + inset,
+      tile - inset * 2,
+      tile - inset * 2,
+    );
+    if (b.kind === "hq") {
+      // White dot in the center for HQs so they stand out.
+      pctx.fillStyle = "#fff";
+      const dot = Math.max(1, Math.floor(tile / 4));
+      pctx.fillRect(
+        b.pos[0] * tile + tile / 2 - dot / 2,
+        b.pos[1] * tile + tile / 2 - dot / 2,
+        dot,
+        dot,
+      );
+    }
+  }
+  // Units as filled dots.
+  for (const u of s.units || []) {
+    pctx.fillStyle = PLAYER_COLORS[u.owner] || "#fff";
+    pctx.beginPath();
+    pctx.arc(
+      u.pos[0] * tile + tile / 2,
+      u.pos[1] * tile + tile / 2,
+      Math.max(1.5, tile * 0.32),
+      0,
+      Math.PI * 2,
+    );
+    pctx.fill();
   }
 }
 
