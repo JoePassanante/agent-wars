@@ -20,7 +20,8 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::game::{
-    ActionReport, Coord, GAME_VERSION, GameState, MAP_GENERATOR_VERSION, PlayerId, UnitKind,
+    ActionReport, Coord, GAME_VERSION, GameState, MAP_GENERATOR_VERSION, PlayerId,
+    TURN_DURATION_SECS, UnitKind,
 };
 
 pub type SessionId = Uuid;
@@ -38,6 +39,9 @@ pub struct SessionRef {
     pub finished_at: Mutex<Option<Instant>>,
     /// Append-only log for replay reconstruction.
     pub replay: Mutex<Replay>,
+    /// Unix-epoch seconds when the active player's turn auto-ends. Bumped
+    /// every time end_turn fires (manual or via the timer task).
+    pub turn_deadline_secs: Mutex<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,8 +122,9 @@ impl Lobby {
     }
 
     /// Pop two queued users and create a fresh session for them. Returns
-    /// the new session id (or `None` if there weren't enough waiters).
-    pub fn try_match_pair(&mut self) -> Option<SessionId> {
+    /// the new session ref (or `None` if there weren't enough waiters) so
+    /// callers can schedule the first turn's timer task.
+    pub fn try_match_pair(&mut self) -> Option<Arc<SessionRef>> {
         if self.queue.len() < 2 {
             return None;
         }
@@ -151,8 +156,9 @@ impl Lobby {
             created_at: Instant::now(),
             finished_at: Mutex::new(None),
             replay: Mutex::new(replay),
+            turn_deadline_secs: Mutex::new(now_secs() + TURN_DURATION_SECS),
         });
-        self.sessions.insert(session_id, session);
+        self.sessions.insert(session_id, session.clone());
         self.user_index.insert(
             p1.username.clone(),
             UserPresence::InSession {
@@ -173,7 +179,7 @@ impl Lobby {
         if let Some(tx) = self.match_notifiers.remove(&p2.username) {
             let _ = tx.send((session_id, PlayerId::P2));
         }
-        Some(session_id)
+        Some(session)
     }
 
     /// Remove a queued user (e.g. on disconnect before match).
@@ -241,6 +247,64 @@ pub fn schedule_session_finish(state: AppState, session: Arc<SessionRef>, winner
     });
 }
 
+/// Spawn a task that force-ends the active player's turn after
+/// `TURN_DURATION_SECS` if neither manual end_turn nor surrender flips the
+/// state in the meantime. Captures the (turn, player) snapshot so a
+/// voluntary end_turn just makes the spawned task a no-op when it wakes —
+/// no JoinHandle juggling needed.
+pub fn schedule_turn_timer(
+    state: AppState,
+    session: Arc<SessionRef>,
+    expected_turn: u32,
+    expected_player: PlayerId,
+) {
+    schedule_turn_timer_with_duration(
+        state,
+        session,
+        expected_turn,
+        expected_player,
+        Duration::from_secs(TURN_DURATION_SECS),
+    );
+}
+
+/// Internal variant the tests use to drive the timer with sub-second delays
+/// instead of the 10-second production budget.
+pub fn schedule_turn_timer_with_duration(
+    state: AppState,
+    session: Arc<SessionRef>,
+    expected_turn: u32,
+    expected_player: PlayerId,
+    duration: Duration,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(duration).await;
+
+        let mut g = session.game.lock().await;
+        let unchanged = g.turn_number == expected_turn
+            && g.current_turn == expected_player
+            && g.winner.is_none();
+        if !unchanged {
+            return;
+        }
+        if g.end_turn(expected_player).is_err() {
+            return;
+        }
+        let next_turn_number = g.turn_number;
+        let next_player = g.current_turn;
+        drop(g);
+
+        *session.turn_deadline_secs.lock().await = now_secs() + TURN_DURATION_SECS;
+        session.replay.lock().await.events.push(ReplayEvent::EndTurn {
+            actor: expected_player,
+        });
+        let _ = session.tx.send(());
+
+        // Recurse for the next turn at the same (test-driven) cadence so a
+        // chain of forced ends remains observable.
+        schedule_turn_timer_with_duration(state, session, next_turn_number, next_player, duration);
+    });
+}
+
 async fn persist_replay(replay: &Replay) -> std::io::Result<()> {
     let dir = std::path::Path::new("replays");
     tokio::fs::create_dir_all(dir).await?;
@@ -271,3 +335,87 @@ impl AppState {
 
 /// Helper for tests / writer task — drains an mpsc into a websocket sink.
 pub fn _writer_marker(_: &mpsc::Sender<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::GameState;
+
+    async fn make_session() -> (AppState, Arc<SessionRef>) {
+        let state = AppState::new();
+        let game = GameState::new();
+        let map_seed = game.map_seed;
+        let (tx, _) = broadcast::channel(64);
+        let mut players = HashMap::new();
+        players.insert(PlayerId::P1, "alice".to_string());
+        players.insert(PlayerId::P2, "bob".to_string());
+        let session = Arc::new(SessionRef {
+            id: Uuid::new_v4(),
+            game: Mutex::new(game),
+            tx,
+            players: players.clone(),
+            created_at: Instant::now(),
+            finished_at: Mutex::new(None),
+            replay: Mutex::new(Replay {
+                session_id: Uuid::nil(),
+                map_seed,
+                map_generator_version: MAP_GENERATOR_VERSION,
+                game_version: GAME_VERSION.to_string(),
+                started_at: now_secs(),
+                ended_at: None,
+                players,
+                winner: None,
+                events: vec![],
+            }),
+            turn_deadline_secs: Mutex::new(now_secs() + TURN_DURATION_SECS),
+        });
+        (state, session)
+    }
+
+    #[tokio::test]
+    async fn timer_force_ends_idle_player() {
+        let (state, session) = make_session().await;
+        schedule_turn_timer_with_duration(
+            state,
+            session.clone(),
+            1,
+            PlayerId::P1,
+            Duration::from_millis(30),
+        );
+        // Wait comfortably past the timer firing.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let g = session.game.lock().await;
+        assert_eq!(
+            g.current_turn,
+            PlayerId::P2,
+            "P1's idle turn should have force-ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_end_turn_makes_timer_noop() {
+        let (state, session) = make_session().await;
+        schedule_turn_timer_with_duration(
+            state,
+            session.clone(),
+            1,
+            PlayerId::P1,
+            Duration::from_millis(80),
+        );
+        // Voluntarily end P1's turn before the timer fires.
+        {
+            let mut g = session.game.lock().await;
+            g.end_turn(PlayerId::P1).unwrap();
+        }
+        // After the timer would have fired, it should have been a no-op
+        // (snapshot mismatch). The turn pointer must still be P2 (not back to P1).
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        let g = session.game.lock().await;
+        assert_eq!(
+            g.current_turn,
+            PlayerId::P2,
+            "voluntary end_turn must make the spawned timer a no-op"
+        );
+        assert_eq!(g.turn_number, 1, "no double-flip should have occurred");
+    }
+}

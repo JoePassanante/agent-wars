@@ -24,6 +24,11 @@ pub const MAP_GENERATOR_VERSION: u32 = 3;
 /// gameplay. Recorded in replay logs alongside the seed.
 pub const GAME_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Wallclock budget for a single player's turn. Once the deadline lapses
+/// the lobby's turn-timer task force-ends the active player's turn —
+/// whatever they did before the deadline stays committed.
+pub const TURN_DURATION_SECS: u64 = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Terrain {
@@ -1434,6 +1439,11 @@ pub struct PlayerView {
     /// the engine itself doesn't track sessions.
     #[serde(default = "uuid::Uuid::nil")]
     pub session_id: uuid::Uuid,
+    /// Unix-epoch seconds when the current turn auto-ends. Set by the WS
+    /// handler from the session's live deadline before sending; engine
+    /// doesn't compute it.
+    #[serde(default)]
+    pub turn_deadline_secs: u64,
     #[serde(default)]
     pub last_action: Option<ActionReport>,
 }
@@ -1557,6 +1567,7 @@ impl GameState {
             factories_used: self.factories_used.iter().copied().collect(),
             map_seed: self.map_seed,
             session_id: uuid::Uuid::nil(),
+            turn_deadline_secs: 0,
             last_action: self.last_action.clone(),
         }
     }

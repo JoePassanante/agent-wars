@@ -29,9 +29,33 @@ pub enum ClientMsg {
     },
     EndTurn,
     Surrender,
+    /// Submit an entire turn's worth of actions in a single message.
+    /// Server applies them in order; on the first action that returns an
+    /// error, processing stops (prior actions remain committed) and the
+    /// error is reported back. Designed for agents that want to spend their
+    /// 10s budget thinking once and committing once.
+    PlayTurn {
+        actions: Vec<TurnAction>,
+    },
     /// Resign / stop spectating. Detaches the user from the session
     /// (players who Leave forfeit by surrendering).
     Leave,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum TurnAction {
+    Move {
+        unit_id: Uuid,
+        to: Coord,
+        #[serde(default)]
+        attack: Option<Coord>,
+    },
+    BuyUnit {
+        factory_id: Uuid,
+        kind: UnitKind,
+    },
+    EndTurn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

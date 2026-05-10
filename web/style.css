@@ -67,6 +67,16 @@ header h1 {
   border-color: rgba(246, 195, 74, 0.4);
   background: rgba(246, 195, 74, 0.1);
 }
+.hud #clockChip.warn {
+  color: #ffba6e;
+  border-color: rgba(255, 186, 110, 0.4);
+  background: rgba(255, 186, 110, 0.08);
+}
+.hud #clockChip.danger {
+  color: #ff5e6e;
+  border-color: rgba(255, 94, 110, 0.5);
+  background: rgba(255, 94, 110, 0.12);
+}
 
 .controls {
   display: flex;

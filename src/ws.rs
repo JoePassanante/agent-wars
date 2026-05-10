@@ -25,12 +25,12 @@ use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::game::{GAME_VERSION, PlayerId, View};
+use crate::game::{GAME_VERSION, PlayerId, TURN_DURATION_SECS, View};
 use crate::lobby::{
-    AppState, QueueEntry, ReplayEvent, SessionId, SessionRef, UserPresence,
-    schedule_session_finish,
+    AppState, QueueEntry, ReplayEvent, SessionId, SessionRef, UserPresence, now_secs,
+    schedule_session_finish, schedule_turn_timer,
 };
-use crate::proto::{ClientIntent, ClientMsg, ServerMsg};
+use crate::proto::{ClientIntent, ClientMsg, ServerMsg, TurnAction};
 
 const MIN_USERNAME_LEN: usize = 1;
 const MAX_USERNAME_LEN: usize = 32;
@@ -107,6 +107,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let mut g = session.game.lock().await;
         let mut pview = g.view_for(view);
         pview.session_id = session.id;
+        pview.turn_deadline_secs = *session.turn_deadline_secs.lock().await;
         if out_tx.send(ServerMsg::State(pview)).await.is_err() {
             drop(out_tx);
             let _ = writer.await;
@@ -124,6 +125,8 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let mut g = s.game.lock().await;
                 let mut pview = g.view_for(view);
                 pview.session_id = s.id;
+                let deadline = *s.turn_deadline_secs.lock().await;
+                pview.turn_deadline_secs = deadline;
                 if tx.send(ServerMsg::State(pview)).await.is_err() {
                     break;
                 }
@@ -279,7 +282,11 @@ async fn attach_as_player(
         let _ = out_tx.send(ServerMsg::Queued { position: pos }).await;
 
         // Try to immediately match; harmless if nobody else is waiting.
-        if lobby.try_match_pair().is_some() {
+        if let Some(new_session) = lobby.try_match_pair() {
+            // Kick the turn-1 timer for the freshly-created session. The
+            // recursive scheduling inside the timer task handles every
+            // subsequent turn.
+            schedule_turn_timer(state.clone(), new_session, 1, PlayerId::P1);
             let _ = state.lobby_tx.send(()); // notify any lobby browsers
         }
         rx
@@ -383,14 +390,23 @@ async fn handle_command(
         }
         ClientMsg::EndTurn => {
             let actor = require_player(view)?;
-            session.game.lock().await.end_turn(actor)?;
+            let next_state = {
+                let mut g = session.game.lock().await;
+                g.end_turn(actor)?;
+                (g.turn_number, g.current_turn, g.winner)
+            };
             session
                 .replay
                 .lock()
                 .await
                 .events
                 .push(ReplayEvent::EndTurn { actor });
+            *session.turn_deadline_secs.lock().await = now_secs() + TURN_DURATION_SECS;
             let _ = session.tx.send(());
+            // Schedule next turn's timer (no-op if game already over).
+            if next_state.2.is_none() {
+                schedule_turn_timer(state.clone(), session.clone(), next_state.0, next_state.1);
+            }
             Ok(false)
         }
         ClientMsg::Surrender => {
@@ -406,7 +422,96 @@ async fn handle_command(
             check_finish(state, session).await;
             Ok(false)
         }
+        ClientMsg::PlayTurn { actions } => {
+            let actor = require_player(view)?;
+            // Apply actions in order, stop on first error. Prior actions
+            // remain committed so a partial turn still progresses the
+            // game forward.
+            let mut error: Option<String> = None;
+            let mut turn_ended = false;
+            for action in actions {
+                let result =
+                    apply_turn_action(&state, session, actor, action.clone(), &mut turn_ended)
+                        .await;
+                if let Err(e) = result {
+                    error = Some(e);
+                    break;
+                }
+            }
+            // One broadcast for the whole batch.
+            let _ = session.tx.send(());
+            check_finish(state, session).await;
+            if let Some(e) = error { Err(e) } else { Ok(false) }
+        }
         ClientMsg::Leave => Ok(true),
+    }
+}
+
+/// Apply one element of a `PlayTurn` batch. Mirrors the per-message handlers
+/// but returns Err on the first failure so the caller can stop. `turn_ended`
+/// is set to true once an EndTurn lands so subsequent actions in the same
+/// batch are rejected (you can't keep moving after ending the turn).
+async fn apply_turn_action(
+    state: &AppState,
+    session: &Arc<SessionRef>,
+    actor: PlayerId,
+    action: TurnAction,
+    turn_ended: &mut bool,
+) -> Result<(), String> {
+    if *turn_ended {
+        return Err("EndTurn already issued earlier in this batch".into());
+    }
+    match action {
+        TurnAction::Move {
+            unit_id,
+            to,
+            attack,
+        } => {
+            let report = {
+                let mut g = session.game.lock().await;
+                g.try_action(actor, unit_id, to, attack)?
+            };
+            session.replay.lock().await.events.push(ReplayEvent::Move {
+                actor,
+                unit_id,
+                to,
+                attack,
+                report,
+            });
+            Ok(())
+        }
+        TurnAction::BuyUnit { factory_id, kind } => {
+            let new_unit_id = {
+                let mut g = session.game.lock().await;
+                g.try_buy_unit(actor, factory_id, kind)?
+            };
+            session.replay.lock().await.events.push(ReplayEvent::Buy {
+                actor,
+                factory_id,
+                kind,
+                new_unit_id,
+            });
+            Ok(())
+        }
+        TurnAction::EndTurn => {
+            let next_state = {
+                let mut g = session.game.lock().await;
+                g.end_turn(actor)?;
+                (g.turn_number, g.current_turn, g.winner)
+            };
+            session
+                .replay
+                .lock()
+                .await
+                .events
+                .push(ReplayEvent::EndTurn { actor });
+            *session.turn_deadline_secs.lock().await = now_secs() + TURN_DURATION_SECS;
+            if next_state.2.is_none() {
+                schedule_turn_timer(state.clone(), session.clone(), next_state.0, next_state.1);
+            }
+            *turn_ended = true;
+            Ok(())
+        }
     }
 }
 

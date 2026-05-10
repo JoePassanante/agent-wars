@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agent_wars::game::{Coord, GameState, PlayerId, PlayerView, Terrain, Unit, UnitKind};
-use agent_wars::proto::{ClientIntent, ClientMsg, ServerMsg};
+use agent_wars::proto::{ClientIntent, ClientMsg, ServerMsg, TurnAction};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -435,6 +435,27 @@ fn list_tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
         json!({
+            "name": "play_turn",
+            "description": "Submit your ENTIRE turn in one round-trip: an ordered list of move/buy/endTurn actions that the server applies in sequence. Stops on the first error (prior actions stay committed). Strongly recommended for agents working under the 10-second turn budget — one MCP call instead of N. Action format: { type: 'move', unitId, to: [x,y], target?: [x,y] } | { type: 'buyUnit', factoryId, kind } | { type: 'endTurn' }.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "enum": ["move", "buyUnit", "endTurn"] }
+                            },
+                            "required": ["type"]
+                        },
+                        "description": "Ordered list of actions to apply this turn. Include endTurn last to release the turn; omit it to keep your turn open for follow-up tools."
+                    }
+                },
+                "required": ["actions"]
+            }
+        }),
+        json!({
             "name": "list_sessions",
             "description": "List currently active sessions (lobby browser). Returns each session's id, map size, turn number, active player, and unit counts. Useful for understanding the lobby state but not normally needed for play — your assigned session was given to you in the matchmaking response.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
@@ -453,6 +474,7 @@ async fn dispatch_tool(
         "attackable_targets" => handle_attackable(client, args).await,
         "act" => handle_act(client, args).await,
         "buy_unit" => handle_buy_unit(client, args).await,
+        "play_turn" => handle_play_turn(client, args).await,
         "unit_stats" => Ok(format_unit_stats()),
         "simulate_attack" => handle_simulate_attack(client, args).await,
         "list_sessions" => handle_list_sessions().await,
@@ -859,6 +881,95 @@ async fn handle_simulate_attack(
     }
 }
 
+async fn handle_play_turn(client: &Arc<McpClient>, args: &Value) -> Result<String, String> {
+    let raw = args
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .ok_or("expected `actions` array")?;
+    if raw.is_empty() {
+        return Err("actions array is empty".into());
+    }
+    let mut actions: Vec<TurnAction> = Vec::with_capacity(raw.len());
+    for (i, v) in raw.iter().enumerate() {
+        let t = v
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("action[{i}]: missing `type`"))?;
+        match t {
+            "move" => {
+                let unit_id = parse_uuid_field(v, "unitId")
+                    .map_err(|e| format!("action[{i}].{e}"))?;
+                let to = parse_coord(v.get("to"))
+                    .map_err(|e| format!("action[{i}].to: {e}"))?;
+                let attack = match v.get("target") {
+                    Some(Value::Null) | None => None,
+                    Some(coord) => Some(
+                        parse_coord(Some(coord))
+                            .map_err(|e| format!("action[{i}].target: {e}"))?,
+                    ),
+                };
+                actions.push(TurnAction::Move { unit_id, to, attack });
+            }
+            "buyUnit" => {
+                let factory_id = parse_uuid_field(v, "factoryId")
+                    .map_err(|e| format!("action[{i}].{e}"))?;
+                let kind_str = v
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("action[{i}].kind: required"))?;
+                let kind = parse_unit_kind(kind_str)
+                    .map_err(|e| format!("action[{i}].kind: {e}"))?;
+                actions.push(TurnAction::BuyUnit { factory_id, kind });
+            }
+            "endTurn" => actions.push(TurnAction::EndTurn),
+            other => {
+                return Err(format!(
+                    "action[{i}]: unknown type '{other}' (use move | buyUnit | endTurn)"
+                ));
+            }
+        }
+    }
+
+    let mut events = client.events.subscribe();
+    client
+        .cmd_tx
+        .send(ClientMsg::PlayTurn { actions })
+        .await
+        .map_err(|_| "writer task dead".to_string())?;
+    match wait_for_response(&mut events).await? {
+        ServerMsg::Error { message } => Err(message),
+        ServerMsg::State(new) => {
+            let me = client.player();
+            let mut s = format!(
+                "play_turn applied. Turn {}, active {:?} (you are {:?}).",
+                new.turn_number, new.current_turn, me
+            );
+            if let Some(deadline) = Some(new.turn_deadline_secs) {
+                let remaining = deadline.saturating_sub(agent_wars::lobby::now_secs());
+                s.push_str(&format!(" {remaining}s remaining on the clock."));
+            }
+            if let Some(w) = new.winner {
+                let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
+                s.push_str(&format!("\nGAME OVER — Winner: {:?} ({outcome}).\n", w));
+                s.push_str(&summarize_final_state(&new, me));
+            } else {
+                s.push('\n');
+            }
+            Ok(s)
+        }
+        _ => Err("unexpected server response".into()),
+    }
+}
+
+fn parse_uuid_field(v: &Value, field: &str) -> Result<Uuid, String> {
+    let s = v
+        .get(field)
+        .and_then(|s| s.as_str())
+        .ok_or_else(|| format!("{field}: required"))?;
+    s.parse()
+        .map_err(|e: uuid::Error| format!("{field}: {e}"))
+}
+
 async fn handle_buy_unit(client: &Arc<McpClient>, args: &Value) -> Result<String, String> {
     let factory_id_str = args
         .get("factoryId")
@@ -1153,6 +1264,10 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
          WIN: Only by destroying the enemy HQ (down to 0 HP, total 10 damage) or by their surrender. \
          Wiping out every enemy unit does NOT win — they can rebuild at their factory and you have \
          to crack the HQ. Surrender is allowed from turn 4 onward.\n\n\
+         TURN BUDGET: each player has 10 SECONDS of wallclock time per turn. If you don't end_turn \
+         in time, the server force-ends for you and whatever you already committed stays. Prefer \
+         `play_turn` (submit a list of actions in one round-trip) over per-action calls when the \
+         clock is tight.\n\n\
          TURN FLOW: Each of your units gets exactly ONE action per turn (move OR move+attack OR \
          stay+attack). You may act with ALL of them in any order — there is NO per-turn limit on how \
          many units you act with. After you've issued every action you want, call end_turn.\n\n\
@@ -1189,6 +1304,18 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         "Map seed: {}. Turn {}; active player: {:?}; you are {:?}.\n",
         view.map_seed, view.turn_number, view.current_turn, me
     ));
+    let remaining = view
+        .turn_deadline_secs
+        .saturating_sub(agent_wars::lobby::now_secs());
+    if view.current_turn == me {
+        s.push_str(&format!(
+            "Turn clock: {remaining}s remaining (server auto-ends at 0s).\n"
+        ));
+    } else {
+        s.push_str(&format!(
+            "Turn clock: {remaining}s on opponent's turn.\n"
+        ));
+    }
     if let Some(w) = view.winner {
         let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
         s.push_str(&format!("GAME OVER — Winner: {:?} ({outcome}).\n", w));

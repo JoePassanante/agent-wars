@@ -33,6 +33,8 @@ const els = {
   currentTurn: document.getElementById("currentTurn"),
   funds: document.getElementById("funds"),
   mapSeed: document.getElementById("mapSeed"),
+  clock: document.getElementById("clock"),
+  clockChip: document.getElementById("clockChip"),
   winner: document.getElementById("winner"),
   canvas: document.getElementById("board"),
   buyPanel: document.getElementById("buyPanel"),
@@ -246,6 +248,20 @@ setInterval(() => {
   if (els.lobby.style.display !== "none" && !ws) refreshSessions();
 }, 3000);
 refreshSessions();
+
+// Tick the turn-clock chip 4× per second so the countdown feels alive
+// without re-rendering the whole HUD.
+setInterval(() => {
+  if (!state || !state.turnDeadlineSecs) {
+    els.clock.textContent = "–";
+    els.clockChip.classList.remove("warn", "danger");
+    return;
+  }
+  const remaining = Math.max(0, state.turnDeadlineSecs - Math.floor(Date.now() / 1000));
+  els.clock.textContent = `${remaining}s`;
+  els.clockChip.classList.toggle("warn", remaining > 0 && remaining <= 5);
+  els.clockChip.classList.toggle("danger", remaining > 0 && remaining <= 2);
+}, 250);
 
 els.canvas.addEventListener("contextmenu", (e) => {
   e.preventDefault();
