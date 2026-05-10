@@ -1,0 +1,2443 @@
+{
+  "sessionId": "5e62da32-10be-4b8b-b79d-8493d6be3b0b",
+  "mapSeed": 11830213832263641915,
+  "mapGeneratorVersion": 3,
+  "gameVersion": "0.1.0",
+  "startedAt": 1778352939,
+  "endedAt": 1778353216,
+  "players": {
+    "p2": "helloworld2",
+    "p1": "helloworld"
+  },
+  "winner": "p1",
+  "events": [
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        5,
+        2
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          5,
+          2
+        ],
+        "path": [
+          [
+            3,
+            1
+          ],
+          [
+            3,
+            2
+          ],
+          [
+            4,
+            2
+          ],
+          [
+            5,
+            2
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "96d772df-67ca-4585-8504-2ce21e142330",
+      "to": [
+        3,
+        3
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "96d772df-67ca-4585-8504-2ce21e142330",
+        "movedTo": [
+          3,
+          3
+        ],
+        "path": [
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            1,
+            3
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            3,
+            3
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p1",
+      "factoryId": "327e4301-8d17-4f79-8d18-58b7b2f225ff",
+      "kind": "heavy_infantry",
+      "newUnitId": "47732e57-336c-40a1-b722-2d775f631389"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        8,
+        8
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          8,
+          8
+        ],
+        "path": [
+          [
+            10,
+            9
+          ],
+          [
+            9,
+            9
+          ],
+          [
+            8,
+            9
+          ],
+          [
+            8,
+            8
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+      "to": [
+        7,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+        "movedTo": [
+          7,
+          7
+        ],
+        "path": [
+          [
+            12,
+            9
+          ],
+          [
+            12,
+            8
+          ],
+          [
+            11,
+            8
+          ],
+          [
+            10,
+            8
+          ],
+          [
+            9,
+            8
+          ],
+          [
+            8,
+            8
+          ],
+          [
+            7,
+            8
+          ],
+          [
+            7,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p2",
+      "factoryId": "81be4321-921d-4a2a-b8cf-621ac2925f58",
+      "kind": "infantry",
+      "newUnitId": "d26ce6e5-7171-4624-b899-3db25099ce8b"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "96d772df-67ca-4585-8504-2ce21e142330",
+      "to": [
+        4,
+        9
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "96d772df-67ca-4585-8504-2ce21e142330",
+        "movedTo": [
+          4,
+          9
+        ],
+        "path": [
+          [
+            3,
+            3
+          ],
+          [
+            3,
+            4
+          ],
+          [
+            3,
+            5
+          ],
+          [
+            3,
+            6
+          ],
+          [
+            3,
+            7
+          ],
+          [
+            3,
+            8
+          ],
+          [
+            4,
+            8
+          ],
+          [
+            4,
+            9
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        6,
+        3
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          6,
+          3
+        ],
+        "path": [
+          [
+            5,
+            2
+          ],
+          [
+            5,
+            3
+          ],
+          [
+            6,
+            3
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        3,
+        1
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          3,
+          1
+        ],
+        "path": [
+          [
+            2,
+            0
+          ],
+          [
+            3,
+            0
+          ],
+          [
+            3,
+            1
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p1",
+      "factoryId": "327e4301-8d17-4f79-8d18-58b7b2f225ff",
+      "kind": "infantry",
+      "newUnitId": "51744b20-dc38-4faa-886b-eaa5a4f75400"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+      "to": [
+        7,
+        0
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+        "movedTo": [
+          7,
+          0
+        ],
+        "path": [
+          [
+            7,
+            7
+          ],
+          [
+            7,
+            6
+          ],
+          [
+            7,
+            5
+          ],
+          [
+            7,
+            4
+          ],
+          [
+            7,
+            3
+          ],
+          [
+            7,
+            2
+          ],
+          [
+            7,
+            1
+          ],
+          [
+            7,
+            0
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        10,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          10,
+          7
+        ],
+        "path": [
+          [
+            8,
+            8
+          ],
+          [
+            8,
+            7
+          ],
+          [
+            9,
+            7
+          ],
+          [
+            10,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+      "to": [
+        12,
+        8
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "movedTo": [
+          12,
+          8
+        ],
+        "path": [
+          [
+            11,
+            10
+          ],
+          [
+            12,
+            10
+          ],
+          [
+            12,
+            9
+          ],
+          [
+            12,
+            8
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p2",
+      "factoryId": "81be4321-921d-4a2a-b8cf-621ac2925f58",
+      "kind": "infantry",
+      "newUnitId": "7bc85afe-273a-4630-93b1-832046a234f6"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        8,
+        4
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          8,
+          4
+        ],
+        "path": [
+          [
+            6,
+            3
+          ],
+          [
+            6,
+            4
+          ],
+          [
+            7,
+            4
+          ],
+          [
+            8,
+            4
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        4,
+        2
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          4,
+          2
+        ],
+        "path": [
+          [
+            3,
+            1
+          ],
+          [
+            3,
+            2
+          ],
+          [
+            4,
+            2
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+      "to": [
+        3,
+        2
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "movedTo": [
+          3,
+          2
+        ],
+        "path": [
+          [
+            2,
+            0
+          ],
+          [
+            3,
+            0
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            3,
+            2
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p1",
+      "factoryId": "327e4301-8d17-4f79-8d18-58b7b2f225ff",
+      "kind": "infantry",
+      "newUnitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "96d772df-67ca-4585-8504-2ce21e142330",
+      "to": [
+        10,
+        10
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "96d772df-67ca-4585-8504-2ce21e142330",
+        "movedTo": [
+          10,
+          10
+        ],
+        "path": [
+          [
+            4,
+            9
+          ],
+          [
+            4,
+            10
+          ],
+          [
+            5,
+            10
+          ],
+          [
+            6,
+            10
+          ],
+          [
+            7,
+            10
+          ],
+          [
+            8,
+            10
+          ],
+          [
+            9,
+            10
+          ],
+          [
+            10,
+            10
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+      "to": [
+        12,
+        9
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+        "movedTo": [
+          12,
+          9
+        ],
+        "path": [
+          [
+            11,
+            10
+          ],
+          [
+            12,
+            10
+          ],
+          [
+            12,
+            9
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        10,
+        9
+      ],
+      "attack": [
+        10,
+        10
+      ],
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          10,
+          9
+        ],
+        "path": [
+          [
+            10,
+            7
+          ],
+          [
+            10,
+            8
+          ],
+          [
+            10,
+            9
+          ]
+        ],
+        "targetId": "96d772df-67ca-4585-8504-2ce21e142330",
+        "targetKind": "unit",
+        "damageToDefender": 6,
+        "damageToAttacker": 3,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p2",
+      "factoryId": "81be4321-921d-4a2a-b8cf-621ac2925f58",
+      "kind": "infantry",
+      "newUnitId": "2749f963-46e0-4287-a0c0-a201aa8579ce"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+      "to": [
+        3,
+        0
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+        "movedTo": [
+          3,
+          0
+        ],
+        "path": [
+          [
+            7,
+            0
+          ],
+          [
+            6,
+            0
+          ],
+          [
+            5,
+            0
+          ],
+          [
+            4,
+            0
+          ],
+          [
+            3,
+            0
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+      "to": [
+        1,
+        2
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+        "movedTo": [
+          1,
+          2
+        ],
+        "path": [
+          [
+            2,
+            0
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            1,
+            2
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+      "to": [
+        4,
+        4
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "movedTo": [
+          4,
+          4
+        ],
+        "path": [
+          [
+            3,
+            2
+          ],
+          [
+            3,
+            3
+          ],
+          [
+            3,
+            4
+          ],
+          [
+            4,
+            4
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        5,
+        3
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          5,
+          3
+        ],
+        "path": [
+          [
+            4,
+            2
+          ],
+          [
+            4,
+            3
+          ],
+          [
+            5,
+            3
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        6,
+        4
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          6,
+          4
+        ],
+        "path": [
+          [
+            8,
+            4
+          ],
+          [
+            7,
+            4
+          ],
+          [
+            6,
+            4
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p1",
+      "factoryId": "327e4301-8d17-4f79-8d18-58b7b2f225ff",
+      "kind": "heavy_infantry",
+      "newUnitId": "5d650001-88b6-4b23-8394-bebcf8e045fb"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        10,
+        9
+      ],
+      "attack": [
+        10,
+        10
+      ],
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          10,
+          9
+        ],
+        "path": [
+          [
+            10,
+            9
+          ]
+        ],
+        "targetId": "96d772df-67ca-4585-8504-2ce21e142330",
+        "targetKind": "unit",
+        "damageToDefender": 5,
+        "damageToAttacker": null,
+        "defenderKilled": true,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+      "to": [
+        10,
+        8
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+        "movedTo": [
+          10,
+          8
+        ],
+        "path": [
+          [
+            11,
+            10
+          ],
+          [
+            10,
+            10
+          ],
+          [
+            10,
+            9
+          ],
+          [
+            10,
+            8
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+      "to": [
+        13,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "movedTo": [
+          13,
+          7
+        ],
+        "path": [
+          [
+            12,
+            8
+          ],
+          [
+            12,
+            7
+          ],
+          [
+            13,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+      "to": [
+        11,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+        "movedTo": [
+          11,
+          7
+        ],
+        "path": [
+          [
+            12,
+            9
+          ],
+          [
+            12,
+            8
+          ],
+          [
+            11,
+            8
+          ],
+          [
+            11,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "5d650001-88b6-4b23-8394-bebcf8e045fb",
+      "to": [
+        2,
+        0
+      ],
+      "attack": [
+        3,
+        0
+      ],
+      "report": {
+        "unitId": "5d650001-88b6-4b23-8394-bebcf8e045fb",
+        "movedTo": [
+          2,
+          0
+        ],
+        "path": [
+          [
+            2,
+            0
+          ]
+        ],
+        "targetId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+        "targetKind": "unit",
+        "damageToDefender": 9,
+        "damageToAttacker": 0,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+      "to": [
+        3,
+        1
+      ],
+      "attack": [
+        3,
+        0
+      ],
+      "report": {
+        "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+        "movedTo": [
+          3,
+          1
+        ],
+        "path": [
+          [
+            1,
+            2
+          ],
+          [
+            2,
+            2
+          ],
+          [
+            3,
+            2
+          ],
+          [
+            3,
+            1
+          ]
+        ],
+        "targetId": "c76f0212-5a4c-4f07-9658-3dcb6beeefc8",
+        "targetKind": "unit",
+        "damageToDefender": 7,
+        "damageToAttacker": null,
+        "defenderKilled": true,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+      "to": [
+        5,
+        5
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "movedTo": [
+          5,
+          5
+        ],
+        "path": [
+          [
+            4,
+            4
+          ],
+          [
+            4,
+            5
+          ],
+          [
+            5,
+            5
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        5,
+        4
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          5,
+          4
+        ],
+        "path": [
+          [
+            5,
+            3
+          ],
+          [
+            5,
+            4
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        7,
+        5
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          7,
+          5
+        ],
+        "path": [
+          [
+            6,
+            4
+          ],
+          [
+            6,
+            5
+          ],
+          [
+            7,
+            5
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+      "to": [
+        9,
+        6
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+        "movedTo": [
+          9,
+          6
+        ],
+        "path": [
+          [
+            10,
+            8
+          ],
+          [
+            9,
+            8
+          ],
+          [
+            9,
+            7
+          ],
+          [
+            9,
+            6
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        9,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          9,
+          7
+        ],
+        "path": [
+          [
+            10,
+            9
+          ],
+          [
+            9,
+            9
+          ],
+          [
+            9,
+            8
+          ],
+          [
+            9,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+      "to": [
+        8,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+        "movedTo": [
+          8,
+          7
+        ],
+        "path": [
+          [
+            11,
+            7
+          ],
+          [
+            10,
+            7
+          ],
+          [
+            9,
+            7
+          ],
+          [
+            8,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+      "to": [
+        10,
+        7
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "movedTo": [
+          10,
+          7
+        ],
+        "path": [
+          [
+            13,
+            7
+          ],
+          [
+            12,
+            7
+          ],
+          [
+            11,
+            7
+          ],
+          [
+            10,
+            7
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p2",
+      "factoryId": "81be4321-921d-4a2a-b8cf-621ac2925f58",
+      "kind": "heavy_infantry",
+      "newUnitId": "0e8ce7fa-0daa-4b43-a056-44221988fe58"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        6,
+        5
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          6,
+          5
+        ],
+        "path": [
+          [
+            5,
+            4
+          ],
+          [
+            5,
+            5
+          ],
+          [
+            6,
+            5
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+      "to": [
+        5,
+        6
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "movedTo": [
+          5,
+          6
+        ],
+        "path": [
+          [
+            5,
+            5
+          ],
+          [
+            5,
+            6
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        7,
+        4
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          7,
+          4
+        ],
+        "path": [
+          [
+            7,
+            5
+          ],
+          [
+            7,
+            4
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+      "to": [
+        4,
+        3
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+        "movedTo": [
+          4,
+          3
+        ],
+        "path": [
+          [
+            3,
+            1
+          ],
+          [
+            3,
+            2
+          ],
+          [
+            3,
+            3
+          ],
+          [
+            4,
+            3
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "5d650001-88b6-4b23-8394-bebcf8e045fb",
+      "to": [
+        3,
+        1
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "5d650001-88b6-4b23-8394-bebcf8e045fb",
+        "movedTo": [
+          3,
+          1
+        ],
+        "path": [
+          [
+            2,
+            0
+          ],
+          [
+            3,
+            0
+          ],
+          [
+            3,
+            1
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+      "to": [
+        7,
+        5
+      ],
+      "attack": [
+        6,
+        5
+      ],
+      "report": {
+        "unitId": "7bc85afe-273a-4630-93b1-832046a234f6",
+        "movedTo": [
+          7,
+          5
+        ],
+        "path": [
+          [
+            8,
+            7
+          ],
+          [
+            7,
+            7
+          ],
+          [
+            7,
+            6
+          ],
+          [
+            7,
+            5
+          ]
+        ],
+        "targetId": "47732e57-336c-40a1-b722-2d775f631389",
+        "targetKind": "unit",
+        "damageToDefender": 3,
+        "damageToAttacker": 4,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        7,
+        6
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          7,
+          6
+        ],
+        "path": [
+          [
+            9,
+            7
+          ],
+          [
+            8,
+            7
+          ],
+          [
+            7,
+            7
+          ],
+          [
+            7,
+            6
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+      "to": [
+        8,
+        4
+      ],
+      "attack": [
+        7,
+        4
+      ],
+      "report": {
+        "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+        "movedTo": [
+          8,
+          4
+        ],
+        "path": [
+          [
+            9,
+            6
+          ],
+          [
+            8,
+            6
+          ],
+          [
+            8,
+            5
+          ],
+          [
+            8,
+            4
+          ]
+        ],
+        "targetId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "targetKind": "unit",
+        "damageToDefender": 5,
+        "damageToAttacker": 2,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+      "to": [
+        8,
+        6
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "movedTo": [
+          8,
+          6
+        ],
+        "path": [
+          [
+            10,
+            7
+          ],
+          [
+            9,
+            7
+          ],
+          [
+            8,
+            7
+          ],
+          [
+            8,
+            6
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "0e8ce7fa-0daa-4b43-a056-44221988fe58",
+      "to": [
+        10,
+        9
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "0e8ce7fa-0daa-4b43-a056-44221988fe58",
+        "movedTo": [
+          10,
+          9
+        ],
+        "path": [
+          [
+            11,
+            10
+          ],
+          [
+            10,
+            10
+          ],
+          [
+            10,
+            9
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p2",
+      "factoryId": "81be4321-921d-4a2a-b8cf-621ac2925f58",
+      "kind": "infantry",
+      "newUnitId": "896927e8-5579-41df-9f44-9277f09da5a1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        6,
+        5
+      ],
+      "attack": [
+        7,
+        5
+      ],
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          6,
+          5
+        ],
+        "path": [
+          [
+            6,
+            5
+          ]
+        ],
+        "targetId": "7bc85afe-273a-4630-93b1-832046a234f6",
+        "targetKind": "unit",
+        "damageToDefender": 4,
+        "damageToAttacker": 1,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        7,
+        4
+      ],
+      "attack": [
+        7,
+        5
+      ],
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          7,
+          4
+        ],
+        "path": [
+          [
+            7,
+            4
+          ]
+        ],
+        "targetId": "7bc85afe-273a-4630-93b1-832046a234f6",
+        "targetKind": "unit",
+        "damageToDefender": 3,
+        "damageToAttacker": null,
+        "defenderKilled": true,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+      "to": [
+        6,
+        6
+      ],
+      "attack": [
+        7,
+        6
+      ],
+      "report": {
+        "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "movedTo": [
+          6,
+          6
+        ],
+        "path": [
+          [
+            5,
+            6
+          ],
+          [
+            6,
+            6
+          ]
+        ],
+        "targetId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "targetKind": "unit",
+        "damageToDefender": 5,
+        "damageToAttacker": 1,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+      "to": [
+        7,
+        3
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+        "movedTo": [
+          7,
+          3
+        ],
+        "path": [
+          [
+            4,
+            3
+          ],
+          [
+            5,
+            3
+          ],
+          [
+            6,
+            3
+          ],
+          [
+            7,
+            3
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+      "to": [
+        7,
+        6
+      ],
+      "attack": [
+        6,
+        6
+      ],
+      "report": {
+        "unitId": "715262ef-0b64-487b-934d-77cb8f21c040",
+        "movedTo": [
+          7,
+          6
+        ],
+        "path": [
+          [
+            7,
+            6
+          ]
+        ],
+        "targetId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "targetKind": "unit",
+        "damageToDefender": 1,
+        "damageToAttacker": 4,
+        "defenderKilled": false,
+        "attackerKilled": true
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+      "to": [
+        7,
+        6
+      ],
+      "attack": [
+        6,
+        6
+      ],
+      "report": {
+        "unitId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "movedTo": [
+          7,
+          6
+        ],
+        "path": [
+          [
+            8,
+            6
+          ],
+          [
+            7,
+            6
+          ]
+        ],
+        "targetId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "targetKind": "unit",
+        "damageToDefender": 5,
+        "damageToAttacker": 1,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+      "to": [
+        8,
+        4
+      ],
+      "attack": [
+        7,
+        4
+      ],
+      "report": {
+        "unitId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+        "movedTo": [
+          8,
+          4
+        ],
+        "path": [
+          [
+            8,
+            4
+          ]
+        ],
+        "targetId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "targetKind": "unit",
+        "damageToDefender": 4,
+        "damageToAttacker": 1,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "896927e8-5579-41df-9f44-9277f09da5a1",
+      "to": [
+        10,
+        8
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "896927e8-5579-41df-9f44-9277f09da5a1",
+        "movedTo": [
+          10,
+          8
+        ],
+        "path": [
+          [
+            11,
+            10
+          ],
+          [
+            10,
+            10
+          ],
+          [
+            10,
+            9
+          ],
+          [
+            10,
+            8
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p2",
+      "unitId": "0e8ce7fa-0daa-4b43-a056-44221988fe58",
+      "to": [
+        9,
+        8
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "0e8ce7fa-0daa-4b43-a056-44221988fe58",
+        "movedTo": [
+          9,
+          8
+        ],
+        "path": [
+          [
+            10,
+            9
+          ],
+          [
+            9,
+            9
+          ],
+          [
+            9,
+            8
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+      "to": [
+        7,
+        5
+      ],
+      "attack": [
+        7,
+        6
+      ],
+      "report": {
+        "unitId": "47732e57-336c-40a1-b722-2d775f631389",
+        "movedTo": [
+          7,
+          5
+        ],
+        "path": [
+          [
+            6,
+            5
+          ],
+          [
+            7,
+            5
+          ]
+        ],
+        "targetId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "targetKind": "unit",
+        "damageToDefender": 4,
+        "damageToAttacker": 2,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+      "to": [
+        6,
+        6
+      ],
+      "attack": [
+        7,
+        6
+      ],
+      "report": {
+        "unitId": "51744b20-dc38-4faa-886b-eaa5a4f75400",
+        "movedTo": [
+          6,
+          6
+        ],
+        "path": [
+          [
+            6,
+            6
+          ]
+        ],
+        "targetId": "d26ce6e5-7171-4624-b899-3db25099ce8b",
+        "targetKind": "unit",
+        "damageToDefender": 2,
+        "damageToAttacker": 2,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+      "to": [
+        9,
+        4
+      ],
+      "attack": [
+        8,
+        4
+      ],
+      "report": {
+        "unitId": "c570cf4d-c4ee-4e00-82dd-48706b087de6",
+        "movedTo": [
+          9,
+          4
+        ],
+        "path": [
+          [
+            7,
+            3
+          ],
+          [
+            8,
+            3
+          ],
+          [
+            9,
+            3
+          ],
+          [
+            9,
+            4
+          ]
+        ],
+        "targetId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+        "targetKind": "unit",
+        "damageToDefender": 5,
+        "damageToAttacker": 1,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+      "to": [
+        7,
+        4
+      ],
+      "attack": [
+        8,
+        4
+      ],
+      "report": {
+        "unitId": "3d9f1daa-33c6-4a95-8c95-f35c14f31a25",
+        "movedTo": [
+          7,
+          4
+        ],
+        "path": [
+          [
+            7,
+            4
+          ]
+        ],
+        "targetId": "2749f963-46e0-4287-a0c0-a201aa8579ce",
+        "targetKind": "unit",
+        "damageToDefender": 1,
+        "damageToAttacker": 1,
+        "defenderKilled": false,
+        "attackerKilled": true
+      }
+    },
+    {
+      "type": "move",
+      "actor": "p1",
+      "unitId": "5d650001-88b6-4b23-8394-bebcf8e045fb",
+      "to": [
+        4,
+        2
+      ],
+      "attack": null,
+      "report": {
+        "unitId": "5d650001-88b6-4b23-8394-bebcf8e045fb",
+        "movedTo": [
+          4,
+          2
+        ],
+        "path": [
+          [
+            3,
+            1
+          ],
+          [
+            3,
+            2
+          ],
+          [
+            4,
+            2
+          ]
+        ],
+        "targetId": null,
+        "targetKind": null,
+        "damageToDefender": null,
+        "damageToAttacker": null,
+        "defenderKilled": false,
+        "attackerKilled": false
+      }
+    },
+    {
+      "type": "buy",
+      "actor": "p1",
+      "factoryId": "327e4301-8d17-4f79-8d18-58b7b2f225ff",
+      "kind": "scout",
+      "newUnitId": "f50ac27e-c4ca-42de-b6ef-17bda48a73e1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "surrender",
+      "actor": "p2"
+    }
+  ]
+}

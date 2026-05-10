@@ -607,12 +607,7 @@ function render() {
   // Tiles + grid.
   for (let y = 0; y < map.height; y++) {
     for (let x = 0; x < map.width; x++) {
-      const t = map.tiles[y * map.width + x];
-      ctx.fillStyle = TERRAIN_COLORS[t] || "#222";
-      ctx.fillRect(x * TILE, y * TILE, TILE, TILE);
-      ctx.strokeStyle = "#0006";
-      ctx.lineWidth = 1;
-      ctx.strokeRect(x * TILE + 0.5, y * TILE + 0.5, TILE - 1, TILE - 1);
+      drawTile(x, y, map.tiles[y * map.width + x]);
     }
   }
 
@@ -683,61 +678,256 @@ function render() {
   }
 }
 
+// Pre-baked deterministic positions for the in-tile decorations so a forest
+// always has trees in the same spots and the map doesn't shimmer.
+function drawTile(x, y, terrain) {
+  const px = x * TILE;
+  const py = y * TILE;
+
+  ctx.fillStyle = TERRAIN_COLORS[terrain] || "#222";
+  ctx.fillRect(px, py, TILE, TILE);
+
+  if (terrain === "plains") drawPlainsDetail(px, py, x, y);
+  else if (terrain === "forest") drawForestDetail(px, py, x, y);
+  else if (terrain === "mountain") drawMountainDetail(px, py);
+  else if (terrain === "sea") drawSeaDetail(px, py, x, y);
+
+  ctx.strokeStyle = "#0006";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(px + 0.5, py + 0.5, TILE - 1, TILE - 1);
+}
+
+// Cheap deterministic hash so each (x, y) pulls a stable variant.
+function tileHash(x, y) {
+  let h = (x * 73856093) ^ (y * 19349663);
+  h = (h ^ (h >>> 13)) >>> 0;
+  return h;
+}
+
+function drawPlainsDetail(px, py, x, y) {
+  const h = tileHash(x, y);
+  // Three faint grass tufts at deterministic offsets so the field looks alive.
+  ctx.fillStyle = "#3f6b2c";
+  for (let i = 0; i < 3; i++) {
+    const ox = ((h >>> (i * 4)) & 0xf) * 2 + 6;
+    const oy = ((h >>> (i * 4 + 8)) & 0xf) * 2 + 6;
+    ctx.fillRect(px + ox, py + oy, 2, 1);
+  }
+}
+
+function drawForestDetail(px, py, x, y) {
+  const h = tileHash(x, y);
+  // Two or three small triangle "trees" with subtle position jitter.
+  const seeds = [
+    [12 + ((h >>> 0) & 3), 26 + ((h >>> 2) & 3)],
+    [28 + ((h >>> 4) & 3), 16 + ((h >>> 6) & 3)],
+    [34 + ((h >>> 8) & 3), 32 + ((h >>> 10) & 3)],
+  ];
+  for (const [tx, ty] of seeds) {
+    drawTree(px + tx, py + ty);
+  }
+}
+
+function drawTree(cx, cy) {
+  // Trunk
+  ctx.fillStyle = "#3a2a18";
+  ctx.fillRect(cx - 1, cy + 1, 2, 4);
+  // Canopy: dark triangle stack
+  ctx.fillStyle = "#1c3a13";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 9);
+  ctx.lineTo(cx - 6, cy + 1);
+  ctx.lineTo(cx + 6, cy + 1);
+  ctx.closePath();
+  ctx.fill();
+  // Highlight
+  ctx.fillStyle = "#2c5e22";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 9);
+  ctx.lineTo(cx - 4, cy - 1);
+  ctx.lineTo(cx + 1, cy - 1);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawMountainDetail(px, py) {
+  // Rock silhouette: two overlapping triangles + snow caps.
+  ctx.fillStyle = "#5c4d36";
+  ctx.beginPath();
+  ctx.moveTo(px + TILE * 0.5, py + 8);
+  ctx.lineTo(px + 6, py + TILE - 6);
+  ctx.lineTo(px + TILE - 6, py + TILE - 6);
+  ctx.closePath();
+  ctx.fill();
+  // Smaller foreground peak
+  ctx.fillStyle = "#6e5c41";
+  ctx.beginPath();
+  ctx.moveTo(px + TILE * 0.7, py + 18);
+  ctx.lineTo(px + TILE * 0.3, py + TILE - 6);
+  ctx.lineTo(px + TILE - 6, py + TILE - 6);
+  ctx.closePath();
+  ctx.fill();
+  // Snow caps
+  ctx.fillStyle = "#f0f0f0";
+  ctx.beginPath();
+  ctx.moveTo(px + TILE * 0.5, py + 8);
+  ctx.lineTo(px + TILE * 0.5 - 5, py + 16);
+  ctx.lineTo(px + TILE * 0.5 + 5, py + 16);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawSeaDetail(px, py, x, y) {
+  const h = tileHash(x, y);
+  // Two short wave lines whose y-offset varies by tile.
+  ctx.strokeStyle = "rgba(180, 220, 240, 0.7)";
+  ctx.lineWidth = 1.4;
+  for (let i = 0; i < 2; i++) {
+    const off = 18 + i * 16 + ((h >>> (i * 3)) & 3);
+    ctx.beginPath();
+    ctx.moveTo(px + 8, py + off);
+    ctx.bezierCurveTo(
+      px + 18, py + off - 3,
+      px + 30, py + off + 3,
+      px + TILE - 8, py + off,
+    );
+    ctx.stroke();
+  }
+}
+
 function drawBuilding(b, ghost) {
   const [x, y] = b.pos;
-  const cx = x * TILE + TILE / 2;
-  const cy = y * TILE + TILE / 2;
-  const px = x * TILE + 6;
-  const py = y * TILE + 6;
-  const size = TILE - 12;
-
+  const px = x * TILE;
+  const py = y * TILE;
   const ownerColor = b.owner ? (PLAYER_COLORS[b.owner] || "#aaa") : NEUTRAL_COLOR;
+  const ownerDark = b.owner === "p1" ? "#992233" : b.owner === "p2" ? "#26609a" : "#5a5a5a";
 
   ctx.save();
-  if (ghost) ctx.globalAlpha = 0.5;
-  ctx.fillStyle = ownerColor;
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = ghost ? "#fff7" : "#fff";
-  ctx.setLineDash(ghost ? [4, 3] : []);
+  if (ghost) ctx.globalAlpha = 0.55;
 
-  if (b.kind === "hq") {
-    roundedRect(px, py, size, size, 4);
-    ctx.fill();
-    ctx.stroke();
-    drawStar(cx, cy - 2, 5, TILE * 0.18, TILE * 0.08);
-    drawHpBadge(x, y, b.hp, 10);
-  } else if (b.kind === "factory") {
-    // Squat industrial silhouette: trapezoidal base + small chimney.
-    ctx.beginPath();
-    ctx.moveTo(px, py + size);
-    ctx.lineTo(px, py + size * 0.45);
-    ctx.lineTo(px + size * 0.6, py + size * 0.2);
-    ctx.lineTo(px + size, py + size * 0.45);
-    ctx.lineTo(px + size, py + size);
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-    // Chimney.
-    ctx.fillStyle = ownerColor;
-    ctx.fillRect(px + size * 0.65, py + size * 0.05, size * 0.15, size * 0.25);
-    ctx.strokeRect(px + size * 0.65, py + size * 0.05, size * 0.15, size * 0.25);
-  } else if (b.kind === "city") {
-    // Stack of small windows.
-    ctx.beginPath();
-    ctx.arc(cx, cy, size * 0.45, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-    // Windows grid.
+  if (b.kind === "hq") drawHqGlyph(px, py, ownerColor, ownerDark, ghost);
+  else if (b.kind === "factory") drawFactoryGlyph(px, py, ownerColor, ownerDark, ghost);
+  else if (b.kind === "city") drawCityGlyph(px, py, ownerColor, ownerDark, ghost);
+
+  if (ghost) {
+    // Dashed outline so the player remembers it's stale.
+    ctx.strokeStyle = "#fff8";
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([3, 3]);
+    ctx.strokeRect(px + 3, py + 3, TILE - 6, TILE - 6);
     ctx.setLineDash([]);
-    ctx.fillStyle = "#0a0a0a";
-    const w = size * 0.18;
-    for (const dy of [-w * 1.1, w * 0.1]) {
-      for (const dx of [-w * 0.7, w * 0.3]) {
-        ctx.fillRect(cx + dx, cy + dy, w * 0.5, w * 0.6);
+  }
+  if (b.kind === "hq") drawHpBadge(x, y, b.hp, 10);
+  ctx.restore();
+}
+
+function drawHqGlyph(px, py, color, dark, ghost) {
+  // Castle keep: crenellated rectangle + flagpole.
+  const baseY = py + 18;
+  const w = TILE - 14;
+  const h = TILE - 22;
+  // Walls
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + 7, baseY, w, h);
+  ctx.fillStyle = color;
+  ctx.fillRect(px + 7, baseY, w, h - 4);
+  // Crenellations
+  for (let i = 0; i < 4; i++) {
+    ctx.fillStyle = i % 2 === 0 ? color : dark;
+    ctx.fillRect(px + 7 + i * (w / 4), baseY - 4, w / 4 - 1, 5);
+  }
+  // Door
+  ctx.fillStyle = "#1a1a1a";
+  ctx.fillRect(px + TILE / 2 - 4, py + TILE - 16, 8, 10);
+  // Flagpole
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(px + TILE / 2 - 1, py + 4, 2, 16);
+  // Flag
+  ctx.fillStyle = ghost ? "#aaa" : color;
+  ctx.beginPath();
+  ctx.moveTo(px + TILE / 2 + 1, py + 5);
+  ctx.lineTo(px + TILE / 2 + 11, py + 8);
+  ctx.lineTo(px + TILE / 2 + 1, py + 11);
+  ctx.closePath();
+  ctx.fill();
+  // Outline
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(px + 7, baseY - 4, w, h + 4);
+}
+
+function drawFactoryGlyph(px, py, color, dark, _ghost) {
+  // Sawtooth roof with chimney + smoke puff.
+  const baseY = py + 18;
+  const w = TILE - 12;
+  const h = TILE - 22;
+  // Body
+  ctx.fillStyle = color;
+  ctx.fillRect(px + 6, baseY, w, h);
+  ctx.strokeStyle = "#fff";
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(px + 6, baseY, w, h);
+  // Sawtooth roof
+  const teeth = 4;
+  ctx.fillStyle = dark;
+  ctx.beginPath();
+  ctx.moveTo(px + 6, baseY);
+  for (let i = 0; i < teeth; i++) {
+    const x0 = px + 6 + i * (w / teeth);
+    const x1 = x0 + w / teeth;
+    ctx.lineTo(x0 + w / teeth / 2, baseY - 7);
+    ctx.lineTo(x1, baseY);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  // Chimney
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + TILE - 14, py + 4, 5, 14);
+  ctx.strokeRect(px + TILE - 14, py + 4, 5, 14);
+  // Smoke puff
+  ctx.fillStyle = "rgba(220,220,220,0.6)";
+  ctx.beginPath();
+  ctx.arc(px + TILE - 9, py + 6, 4, 0, Math.PI * 2);
+  ctx.arc(px + TILE - 4, py + 4, 3, 0, Math.PI * 2);
+  ctx.fill();
+  // Door
+  ctx.fillStyle = "#1a1a1a";
+  ctx.fillRect(px + TILE / 2 - 3, py + TILE - 14, 6, 8);
+}
+
+function drawCityGlyph(px, py, color, dark, _ghost) {
+  // Three towers of varying heights with windows.
+  const groundY = py + TILE - 6;
+  const towers = [
+    { x: px + 8,  w: 9,  h: 18 },
+    { x: px + 19, w: 11, h: 26 },
+    { x: px + 32, w: 9,  h: 22 },
+  ];
+  for (const t of towers) {
+    ctx.fillStyle = color;
+    ctx.fillRect(t.x, groundY - t.h, t.w, t.h);
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.2;
+    ctx.strokeRect(t.x, groundY - t.h, t.w, t.h);
+  }
+  // Windows: lit yellow rectangles
+  ctx.fillStyle = "#f6c34a";
+  for (const t of towers) {
+    const cols = t.w >= 10 ? 2 : 1;
+    const colW = (t.w - (cols + 1) * 2) / cols;
+    for (let row = 0; row < Math.floor(t.h / 6); row++) {
+      const wy = groundY - 5 - row * 6;
+      if (wy < py + 6) break;
+      for (let c = 0; c < cols; c++) {
+        const wx = t.x + 2 + c * (colW + 2);
+        ctx.fillRect(wx, wy, colW, 2);
       }
     }
   }
-  ctx.restore();
+  // Banner stripe under the tallest building so you can spot ownership.
+  ctx.fillStyle = dark;
+  ctx.fillRect(px + 4, groundY, TILE - 8, 4);
 }
 
 function drawHpBadge(x, y, hp, max) {
