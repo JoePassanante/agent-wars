@@ -678,8 +678,19 @@ function computeReachable(unit) {
 
 function render() {
   if (!state) {
+    // Make sure the canvas isn't a confusing black void — render a placeholder
+    // explaining we're waiting on the first state push. Keeps the spectator
+    // experience from looking dead during the brief race between Spectating
+    // and the first State message.
+    const w = els.canvas.width || 600;
+    const h = els.canvas.height || 500;
     ctx.fillStyle = "#0d0f12";
-    ctx.fillRect(0, 0, els.canvas.width, els.canvas.height);
+    ctx.fillRect(0, 0, w, h);
+    ctx.fillStyle = "#a0a4ab";
+    ctx.font = "14px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("Waiting for game state…", w / 2, h / 2);
     return;
   }
   const { map } = state;
