@@ -672,6 +672,22 @@ pub struct GameState {
     pub hq_owners: HashSet<PlayerId>,
     /// Cash on hand for each player. Spent on units at factories.
     pub funds: HashMap<PlayerId, u32>,
+    /// Number of successful Move/BuyUnit actions taken this turn. Reset
+    /// at end_turn. Used to decide whether the turn was "idle" (zero
+    /// actions ⇒ idle, anything ⇒ active).
+    #[serde(skip)]
+    pub actions_this_turn: u32,
+    /// Per-player streak of consecutive idle turns (sub-turns where the
+    /// player took zero actions before end_turn). Once a player's streak
+    /// hits 5, the next time their turn comes up the engine auto-
+    /// surrenders for them. If both players hit 5 on the same trigger,
+    /// the game ends in a draw rather than awarding either side.
+    #[serde(skip)]
+    pub idle_streak: HashMap<PlayerId, u32>,
+    /// True when the game ended without a winner (currently only via the
+    /// double-idle-surrender rule). winner stays None in that case.
+    #[serde(default)]
+    pub is_draw: bool,
     /// Factories that have already produced a unit during the current turn.
     /// Cleared at the start of every turn.
     #[serde(skip)]
@@ -804,6 +820,9 @@ impl GameState {
             funds,
             factories_used: HashSet::new(),
             map_seed: seed,
+            actions_this_turn: 0,
+            idle_streak: HashMap::new(),
+            is_draw: false,
         }
     }
 
@@ -1012,7 +1031,7 @@ impl GameState {
         dest: Coord,
         attack: Option<Coord>,
     ) -> Result<ActionReport, String> {
-        if self.winner.is_some() {
+        if self.winner.is_some() || self.is_draw {
             return Err("game is over".into());
         }
         if actor != self.current_turn {
@@ -1172,6 +1191,7 @@ impl GameState {
         }
 
         self.last_action = Some(report.clone());
+        self.actions_this_turn += 1;
         Ok(report)
     }
 
@@ -1179,7 +1199,7 @@ impl GameState {
     /// Concede the match. Only allowed after 3 complete turn cycles
     /// (turn_number >= 4) so neither side can rage-quit immediately.
     pub fn try_surrender(&mut self, actor: PlayerId) -> Result<(), String> {
-        if self.winner.is_some() {
+        if self.winner.is_some() || self.is_draw {
             return Err("game is already over".into());
         }
         if self.turn_number < 4 {
@@ -1196,6 +1216,17 @@ impl GameState {
         if actor != self.current_turn {
             return Err("not your turn".into());
         }
+
+        // Update idle streak for the player ending their turn. Zero
+        // committed actions this turn ⇒ they idled; otherwise they
+        // engaged and the streak resets.
+        let streak = self.idle_streak.entry(actor).or_insert(0);
+        if self.actions_this_turn == 0 {
+            *streak += 1;
+        } else {
+            *streak = 0;
+        }
+        self.actions_this_turn = 0;
 
         // Process captures: any of the actor's units sitting on a capturable
         // building they don't own takes ownership instantly.
@@ -1219,6 +1250,23 @@ impl GameState {
         self.factories_used.clear();
 
         self.last_action = None;
+
+        // Idle-surrender: if the new active player has idled 5 turns
+        // already, this would be their 6th — auto-surrender. If both
+        // players have hit the streak, it's a mutual loss.
+        let me_streak = self.idle_streak.get(&self.current_turn).copied().unwrap_or(0);
+        let other_streak = self
+            .idle_streak
+            .get(&self.current_turn.other())
+            .copied()
+            .unwrap_or(0);
+        if me_streak >= 5 {
+            if other_streak >= 5 {
+                self.is_draw = true;
+            } else {
+                self.winner = Some(self.current_turn.other());
+            }
+        }
         Ok(())
     }
 
@@ -1261,7 +1309,7 @@ impl GameState {
         factory_id: Uuid,
         kind: UnitKind,
     ) -> Result<Uuid, String> {
-        if self.winner.is_some() {
+        if self.winner.is_some() || self.is_draw {
             return Err("game is over".into());
         }
         if actor != self.current_turn {
@@ -1302,6 +1350,7 @@ impl GameState {
             has_moved: true,
         };
         self.units.insert(id, unit);
+        self.actions_this_turn += 1;
         Ok(id)
     }
 
@@ -1425,6 +1474,10 @@ pub struct PlayerView {
     pub current_turn: PlayerId,
     pub turn_number: u32,
     pub winner: Option<PlayerId>,
+    /// True when the match ended in a mutual loss (both players idled too
+    /// long). `winner` will be None.
+    #[serde(default)]
+    pub is_draw: bool,
     pub you: Option<PlayerId>,
     /// Funds visible to this viewer: just their own for players, all for
     /// spectators (and at game over, both players' funds are revealed).
@@ -1562,6 +1615,7 @@ impl GameState {
             current_turn: self.current_turn,
             turn_number: self.turn_number,
             winner: self.winner,
+            is_draw: self.is_draw,
             you: me,
             funds,
             factories_used: self.factories_used.iter().copied().collect(),
@@ -1606,6 +1660,9 @@ mod tests {
             funds: HashMap::new(),
             factories_used: HashSet::new(),
             map_seed: 0,
+            actions_this_turn: 0,
+            idle_streak: HashMap::new(),
+            is_draw: false,
         }
     }
 
@@ -2273,6 +2330,64 @@ mod tests {
         }
         let n = count_disjoint_paths(&map, (2, 0), (2, 4), 3);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn five_idle_turns_auto_surrenders() {
+        // P1 idles five sub-turns; P2 plays a real action between each so
+        // their streak stays at 0. On P1's 6th sub-turn, the engine should
+        // have already declared P2 the winner.
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        let p2_id = id_of(&g, PlayerId::P2, (4, 4));
+
+        for _ in 0..5 {
+            g.end_turn(PlayerId::P1).unwrap();
+            // P2 plays a stay-action (move to current pos = no-op-ish but
+            // counts as an action).
+            g.try_action(PlayerId::P2, p2_id, (4, 4), None).unwrap();
+            g.end_turn(PlayerId::P2).unwrap();
+            // Reset has_moved manually for the test fixture (place() builds
+            // a non-default state). Actually end_turn already resets it.
+        }
+        assert_eq!(g.winner, Some(PlayerId::P2));
+    }
+
+    #[test]
+    fn double_idle_ends_in_draw() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        for _ in 0..5 {
+            g.end_turn(PlayerId::P1).unwrap();
+            g.end_turn(PlayerId::P2).unwrap();
+        }
+        assert!(g.is_draw, "both players idled five turns each → draw");
+        assert_eq!(g.winner, None);
+    }
+
+    #[test]
+    fn action_resets_idle_streak() {
+        let mut g = place(
+            flat_map(5, 5),
+            vec![(PlayerId::P1, (0, 0), 10), (PlayerId::P2, (4, 4), 10)],
+        );
+        let p1_id = id_of(&g, PlayerId::P1, (0, 0));
+
+        // Idle 4 then act on the 5th.
+        for _ in 0..4 {
+            g.end_turn(PlayerId::P1).unwrap();
+            g.end_turn(PlayerId::P2).unwrap();
+        }
+        // P1 acts (then ends turn) — streak should reset to 0.
+        g.try_action(PlayerId::P1, p1_id, (1, 0), None).unwrap();
+        g.end_turn(PlayerId::P1).unwrap();
+        assert_eq!(g.idle_streak.get(&PlayerId::P1).copied().unwrap_or(0), 0);
+        assert!(g.winner.is_none());
+        assert!(!g.is_draw);
     }
 
     #[test]

@@ -393,7 +393,7 @@ async fn handle_command(
             let next_state = {
                 let mut g = session.game.lock().await;
                 g.end_turn(actor)?;
-                (g.turn_number, g.current_turn, g.winner)
+                (g.turn_number, g.current_turn, g.winner, g.is_draw)
             };
             session
                 .replay
@@ -404,8 +404,11 @@ async fn handle_command(
             *session.turn_deadline_secs.lock().await = now_secs() + TURN_DURATION_SECS;
             let _ = session.tx.send(());
             // Schedule next turn's timer (no-op if game already over).
-            if next_state.2.is_none() {
+            if next_state.2.is_none() && !next_state.3 {
                 schedule_turn_timer(state.clone(), session.clone(), next_state.0, next_state.1);
+            } else {
+                // Game ended via idle-surrender / draw triggered by end_turn.
+                check_finish(state, session).await;
             }
             Ok(false)
         }
@@ -497,7 +500,7 @@ async fn apply_turn_action(
             let next_state = {
                 let mut g = session.game.lock().await;
                 g.end_turn(actor)?;
-                (g.turn_number, g.current_turn, g.winner)
+                (g.turn_number, g.current_turn, g.winner, g.is_draw)
             };
             session
                 .replay
@@ -506,7 +509,7 @@ async fn apply_turn_action(
                 .events
                 .push(ReplayEvent::EndTurn { actor });
             *session.turn_deadline_secs.lock().await = now_secs() + TURN_DURATION_SECS;
-            if next_state.2.is_none() {
+            if next_state.2.is_none() && !next_state.3 {
                 schedule_turn_timer(state.clone(), session.clone(), next_state.0, next_state.1);
             }
             *turn_ended = true;
@@ -523,8 +526,11 @@ fn require_player(view: View) -> Result<PlayerId, String> {
 }
 
 async fn check_finish(state: &AppState, session: &Arc<SessionRef>) {
-    let winner = session.game.lock().await.winner;
-    if winner.is_some() {
+    let (winner, is_draw) = {
+        let g = session.game.lock().await;
+        (g.winner, g.is_draw)
+    };
+    if winner.is_some() || is_draw {
         schedule_session_finish(state.clone(), session.clone(), winner);
         let _ = state.lobby_tx.send(()); // notify lobby browsers
     }

@@ -1236,6 +1236,9 @@ fn synthetic_state(view: &PlayerView) -> GameState {
         funds: HashMap::new(),
         factories_used: std::collections::HashSet::new(),
         map_seed: view.map_seed,
+        actions_this_turn: 0,
+        idle_streak: HashMap::new(),
+        is_draw: false,
     }
 }
 
@@ -1263,7 +1266,9 @@ fn format_state(view: &PlayerView, me: PlayerId) -> String {
         "RULES (read carefully — these are easy to misinfer from AW intuition):\n\n\
          WIN: Only by destroying the enemy HQ (down to 0 HP, total 10 damage) or by their surrender. \
          Wiping out every enemy unit does NOT win — they can rebuild at their factory and you have \
-         to crack the HQ. Surrender is allowed from turn 4 onward.\n\n\
+         to crack the HQ. Surrender is allowed from turn 4 onward. IDLE PENALTY: 5 consecutive \
+         turns with zero actions auto-surrenders you on your 6th; if both players idle 5 turns \
+         each, the match ends in a DRAW.\n\n\
          TURN BUDGET: each player has 10 SECONDS of wallclock time per turn. If you don't end_turn \
          in time, the server force-ends for you and whatever you already committed stays. Prefer \
          `play_turn` (submit a list of actions in one round-trip) over per-action calls when the \

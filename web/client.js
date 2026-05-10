@@ -493,6 +493,8 @@ function updateHud() {
   if (state.winner) {
     const outcome = state.you === state.winner ? "you win!" : state.you ? "you lose." : "match over.";
     els.winner.textContent = `${labelPlayer(state.winner)} wins — ${outcome}`;
+  } else if (state.isDraw) {
+    els.winner.textContent = "Draw — both players idled too long.";
   } else if (lastError) {
     els.winner.textContent = `⚠ ${lastError}`;
   } else {

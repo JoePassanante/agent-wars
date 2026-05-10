@@ -282,7 +282,8 @@ pub fn schedule_turn_timer_with_duration(
         let mut g = session.game.lock().await;
         let unchanged = g.turn_number == expected_turn
             && g.current_turn == expected_player
-            && g.winner.is_none();
+            && g.winner.is_none()
+            && !g.is_draw;
         if !unchanged {
             return;
         }
@@ -291,6 +292,8 @@ pub fn schedule_turn_timer_with_duration(
         }
         let next_turn_number = g.turn_number;
         let next_player = g.current_turn;
+        let winner = g.winner;
+        let is_draw = g.is_draw;
         drop(g);
 
         *session.turn_deadline_secs.lock().await = now_secs() + TURN_DURATION_SECS;
@@ -299,9 +302,20 @@ pub fn schedule_turn_timer_with_duration(
         });
         let _ = session.tx.send(());
 
-        // Recurse for the next turn at the same (test-driven) cadence so a
-        // chain of forced ends remains observable.
-        schedule_turn_timer_with_duration(state, session, next_turn_number, next_player, duration);
+        // If the engine ended the game (idle-surrender / draw / HQ kill via
+        // a counterattack triggered earlier), wrap up. Otherwise schedule
+        // the next turn's clock.
+        if winner.is_some() || is_draw {
+            schedule_session_finish(state, session, winner);
+        } else {
+            schedule_turn_timer_with_duration(
+                state,
+                session,
+                next_turn_number,
+                next_player,
+                duration,
+            );
+        }
     });
 }
 
