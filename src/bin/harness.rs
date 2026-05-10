@@ -47,9 +47,17 @@ use uuid::Uuid;
 #[derive(Parser, Debug)]
 #[command(name = "agent-wars-harness", about = "QuickJS scripting sandbox for agent-wars")]
 struct Args {
-    /// Username this harness uses to queue / reconnect. Required.
+    /// Username this harness uses to queue / reconnect. Optional when
+    /// `--agent-workspace` is set — defaults to the workspace directory's
+    /// basename so `./agent1` runs as username `agent1`.
     #[arg(long, alias = "player")]
-    username: String,
+    username: Option<String>,
+    /// Path to an agent's workspace directory. The harness reads/writes
+    /// `script.js` inside this directory instead of the default
+    /// `scripts/<username>.js`. Lets you keep one tree per agent (script,
+    /// notes, logs, etc.) checked into version control independently.
+    #[arg(long, value_name = "DIR")]
+    agent_workspace: Option<PathBuf>,
     /// agent-wars WebSocket URL.
     #[arg(long, default_value = "ws://127.0.0.1:8080/ws")]
     url: String,
@@ -95,13 +103,13 @@ struct HarnessState {
     ai_tx: mpsc::Sender<AiCmd>,
     /// Sender for the QuickJS thread's command queue.
     qjs_tx: std::sync::mpsc::Sender<JsCmd>,
-    /// Where script files live.
-    scripts_dir: PathBuf,
+    /// Resolved on disk path where the script is read/written.
+    script_file: PathBuf,
 }
 
 impl HarnessState {
-    fn script_path(&self) -> PathBuf {
-        self.scripts_dir.join(format!("{}.js", self.username))
+    fn script_path(&self) -> &PathBuf {
+        &self.script_file
     }
 }
 
@@ -139,9 +147,37 @@ struct LogLine {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // Resolve username + script storage. When --agent-workspace is set, we
+    // treat the directory as the agent's home: script.js lives there, and
+    // the dir's basename is the default username.
+    let username = match (&args.username, &args.agent_workspace) {
+        (Some(u), _) => u.clone(),
+        (None, Some(ws)) => ws
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .ok_or("--agent-workspace path has no basename")?,
+        (None, None) => {
+            return Err("either --username or --agent-workspace is required".into());
+        }
+    };
+    let script_file = match &args.agent_workspace {
+        Some(ws) => {
+            std::fs::create_dir_all(ws).ok();
+            ws.join("script.js")
+        }
+        None => {
+            let default_dir = PathBuf::from("scripts");
+            std::fs::create_dir_all(&default_dir).ok();
+            default_dir.join(format!("{username}.js"))
+        }
+    };
+
     eprintln!(
-        "agent-wars-harness starting as username={}, connecting to {}",
-        args.username, args.url
+        "agent-wars-harness starting as username={username}, script_file={}, connecting to {}",
+        script_file.display(),
+        args.url,
     );
 
     // Read OpenRouter key once at startup; missing key just disables subAgent.
@@ -163,18 +199,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (out_cmd_tx, mut out_cmd_rx) = mpsc::channel::<ClientMsg>(32);
     let (events_tx, _) = broadcast::channel::<ServerMsg>(64);
 
-    let scripts_dir = PathBuf::from("scripts");
-    let _ = std::fs::create_dir_all(&scripts_dir);
-
     let state = Arc::new(HarnessState {
-        username: args.username.clone(),
+        username: username.clone(),
         player: OnceLock::new(),
         session_id: OnceLock::new(),
         state: Mutex::new(None),
         game_tx: game_tx.clone(),
         ai_tx: ai_tx.clone(),
         qjs_tx: qjs_tx.clone(),
-        scripts_dir,
+        script_file,
     });
 
     // Reader: drains WS into events broadcast + state cache.
@@ -274,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bootstrap = events_tx_handle().subscribe();
     out_cmd_tx
         .send(ClientMsg::Hello {
-            username: args.username.clone(),
+            username: username.clone(),
             intent: ClientIntent::Play,
         })
         .await?;
@@ -295,9 +328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load existing script if present so the runtime starts warm.
     if let Ok(code) = std::fs::read_to_string(state.script_path()) {
         eprintln!(
-            "loaded existing script for {} ({} bytes)",
-            state.username,
-            code.len()
+            "loaded existing script ({} bytes) from {}",
+            code.len(),
+            state.script_path().display()
         );
         let (tx, rx) = std::sync::mpsc::channel();
         let _ = qjs_tx.send(JsCmd::SetScript { code, ack: tx });
@@ -973,8 +1006,8 @@ async fn handle_set_script(state: &Arc<HarnessState>, args: &Value) -> Result<St
         .map_err(|_| "QuickJS thread dead")?;
     match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(())) => Ok(format!(
-            "script installed and saved to scripts/{}.js",
-            state.username
+            "script installed and saved to {}",
+            state.script_path().display()
         )),
         Ok(Err(e)) => Err(format!("compile error: {e}")),
         Err(_) => Err("QuickJS did not respond in 5s".into()),
