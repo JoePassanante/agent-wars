@@ -971,6 +971,22 @@ fn list_tools() -> Vec<Value> {
             "description": "Return the harness's most recent cached PlayerView (no WS call). Same shape as the game MCP's get_state but without the rules block — this tool is for sanity-checking what the script will see.",
             "inputSchema": { "type": "object", "properties": {}, "required": [] }
         }),
+        json!({
+            "name": "wait_for_turn",
+            "description": "Block until it's THIS player's turn (or the game ends), then return. Use this between rounds — the canonical loop is `wait_for_turn → on_turn → wait_for_turn → ...`. Soft `timeoutSeconds` budget (default 50) so the call returns even if no progress happens; just call again if you get back a 'still waiting' response.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "timeoutSeconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120,
+                        "description": "Max seconds to block. Default 50."
+                    }
+                },
+                "required": []
+            }
+        }),
     ]
 }
 
@@ -985,6 +1001,7 @@ async fn dispatch_tool(
         "on_turn" => handle_on_turn(state, args).await,
         "eval" => handle_eval(state, args).await,
         "get_state" => handle_get_state(state).await,
+        "wait_for_turn" => handle_wait_for_turn(state, args).await,
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -1063,6 +1080,78 @@ async fn handle_eval(state: &Arc<HarnessState>, args: &Value) -> Result<String, 
         Ok(Ok(s)) => Ok(s),
         Ok(Err(e)) => Err(e),
         Err(_) => Err("QuickJS did not respond in 8s".into()),
+    }
+}
+
+async fn handle_wait_for_turn(
+    state: &Arc<HarnessState>,
+    args: &Value,
+) -> Result<String, String> {
+    let timeout_secs = args
+        .get("timeoutSeconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .clamp(1, 120);
+    let me = state
+        .player
+        .get()
+        .copied()
+        .ok_or("harness not yet matched into a session")?;
+
+    // Subscribe BEFORE checking state to avoid missing the transition.
+    let mut events = events_tx_handle().subscribe();
+
+    // Fast path: maybe it's already our turn.
+    if let Some(view) = state.state.lock().await.clone() {
+        if let Some(w) = view.winner {
+            return Ok(format!(
+                "Game is over. Winner: {:?}. (You: {:?}.)",
+                w, me
+            ));
+        }
+        if view.current_turn == me {
+            return Ok(format!(
+                "It's your turn now (turn {}). Call on_turn next.",
+                view.turn_number
+            ));
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            let view = state.state.lock().await.clone();
+            return Ok(match view {
+                Some(v) => format!(
+                    "Still {:?}'s turn (turn {}) after {}s. Call wait_for_turn again to keep waiting.",
+                    v.current_turn, v.turn_number, timeout_secs
+                ),
+                None => "No state yet — server may not be running.".into(),
+            });
+        }
+        match timeout(deadline - now, events.recv()).await {
+            Ok(Ok(_)) => {
+                // State changed somehow — re-check.
+                let view = state.state.lock().await.clone();
+                if let Some(v) = view {
+                    if let Some(w) = v.winner {
+                        return Ok(format!(
+                            "Game is over. Winner: {:?}. (You: {:?}.)",
+                            w, me
+                        ));
+                    }
+                    if v.current_turn == me {
+                        return Ok(format!(
+                            "It's your turn now (turn {}). Call on_turn next.",
+                            v.turn_number
+                        ));
+                    }
+                }
+            }
+            Ok(Err(_)) => return Err("event channel closed".into()),
+            Err(_) => {} // outer loop hits the deadline branch
+        }
     }
 }
 
