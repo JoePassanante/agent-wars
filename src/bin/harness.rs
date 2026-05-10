@@ -33,6 +33,7 @@ use std::thread;
 use std::time::Duration;
 
 use agent_wars::game::{PlayerId, PlayerView, UnitKind};
+use agent_wars::lobby::now_secs;
 use agent_wars::proto::{ClientIntent, ClientMsg, ServerMsg, TurnAction};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
@@ -217,7 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let msg = match msg {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("ws read error: {e}");
+                    eprintln!("[WS<-] read error: {e}");
                     break;
                 }
             };
@@ -225,27 +226,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let server_msg: ServerMsg = match serde_json::from_str(&t) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("bad server msg: {e}");
+                    eprintln!("[WS<-] bad server msg: {e}");
                     continue;
                 }
             };
+            log_server_msg(&server_msg);
             if let ServerMsg::State(view) = &server_msg {
                 *reader_state.state.lock().await = Some(view.clone());
             }
             // events broadcast — used by GameCmd::Send awaits.
             let _ = events_tx_handle().send(server_msg);
         }
-        eprintln!("ws reader exiting");
+        eprintln!("[WS<-] reader exiting (connection closed)");
     });
 
     // Writer: drains out_cmd_rx into the WS sink.
     tokio::spawn(async move {
         while let Some(cmd) = out_cmd_rx.recv().await {
+            log_client_msg(&cmd);
             let s = match serde_json::to_string(&cmd) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
             if ws_tx.send(WsMessage::Text(s)).await.is_err() {
+                eprintln!("[WS->] sink closed; writer exiting");
                 break;
             }
         }
@@ -292,11 +296,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let key = match openrouter_key_owned.as_deref() {
                         Some(k) => k,
                         None => {
+                            eprintln!("[SUB] subAgent.ask called but OPENROUTER_API_KEY unset");
                             let _ = ack.send(Err("OPENROUTER_API_KEY not set".into()));
                             continue;
                         }
                     };
+                    let prompt_preview = preview(&prompt, 120);
+                    eprintln!(
+                        "[SUB] → model={model} prompt({} chars): {}",
+                        prompt.len(),
+                        prompt_preview
+                    );
+                    let started = std::time::Instant::now();
                     let resp = call_openrouter(&client, key, &model, &prompt).await;
+                    match &resp {
+                        Ok(text) => eprintln!(
+                            "[SUB] ← {} chars in {}ms: {}",
+                            text.len(),
+                            started.elapsed().as_millis(),
+                            preview(text, 120)
+                        ),
+                        Err(e) => eprintln!("[SUB] ← error in {}ms: {e}", started.elapsed().as_millis()),
+                    }
                     let _ = ack.send(resp);
                 }
             }
@@ -493,7 +514,7 @@ fn quickjs_main(
             let level_str = level_owned.to_string();
             let f = Function::new(ctx.clone(), move |msg: rquickjs::Value| {
                 let s = stringify_value(&msg);
-                eprintln!("[js {level_str}] {s}");
+                eprintln!("[JS] {level_str}: {s}");
                 buf.lock()
                     .unwrap()
                     .push(LogLine { level: level_str.clone(), message: s });
@@ -686,15 +707,20 @@ fn quickjs_main(
     while let Ok(cmd) = rx.recv() {
         match cmd {
             JsCmd::SetScript { code, ack } => {
+                eprintln!("[JS] set_script ({} chars)", code.len());
                 let result: Result<(), String> = context.with(|ctx| {
                     ctx.eval::<(), _>(code.as_bytes())
                         .catch(&ctx)
                         .map(|_| ())
                         .map_err(|e| format!("{e:?}"))
                 });
+                if let Err(e) = &result {
+                    eprintln!("[JS] set_script compile error: {}", preview(e, 120));
+                }
                 let _ = ack.send(result);
             }
             JsCmd::Eval { code, ack } => {
+                eprintln!("[JS] eval ({} chars): {}", code.len(), preview(&code, 80));
                 let result: Result<String, String> = context.with(|ctx| {
                     let v: rquickjs::Result<rquickjs::Value> = ctx.eval(code.as_bytes());
                     match v.catch(&ctx) {
@@ -705,6 +731,7 @@ fn quickjs_main(
                 let _ = ack.send(result);
             }
             JsCmd::OnTurn { context: js_ctx, ack } => {
+                eprintln!("[JS] on_turn invoked");
                 log_buffer.lock().unwrap().clear();
                 let result: Result<TurnResult, String> = context.with(|ctx| -> Result<TurnResult, String> {
                     let globals = ctx.globals();
@@ -818,6 +845,82 @@ fn parse_actions(v: &rquickjs::Value) -> Result<Vec<TurnAction>, String> {
 /// `JSON.parse(...)` on the JS side; that keeps the bindings ctx-free.
 fn serde_to_json_string<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".into())
+}
+
+/// One-line stderr summary of an outgoing client message. Avoids spamming
+/// the full payload — usually one or two key fields per variant.
+fn log_client_msg(msg: &ClientMsg) {
+    match msg {
+        ClientMsg::Hello { username, intent } => {
+            let intent_label = match intent {
+                ClientIntent::Play => "play",
+                ClientIntent::Watch { session_id } => &format!("watch({session_id})"),
+            };
+            eprintln!("[WS->] Hello username={username} intent={intent_label}");
+        }
+        ClientMsg::Move { unit_id, to, attack } => {
+            let atk = attack
+                .map(|c| format!(" attack=[{},{}]", c.0, c.1))
+                .unwrap_or_default();
+            eprintln!("[WS->] Move {unit_id} → [{},{}]{atk}", to.0, to.1);
+        }
+        ClientMsg::BuyUnit { factory_id, kind } => {
+            eprintln!("[WS->] BuyUnit {kind:?} at factory {factory_id}");
+        }
+        ClientMsg::EndTurn => eprintln!("[WS->] EndTurn"),
+        ClientMsg::Surrender => eprintln!("[WS->] Surrender"),
+        ClientMsg::Leave => eprintln!("[WS->] Leave"),
+        ClientMsg::PlayTurn { actions } => {
+            eprintln!("[WS->] PlayTurn batch ({} actions)", actions.len());
+        }
+    }
+}
+
+/// Truncate a string for log lines, replacing newlines with `⏎` so each
+/// log entry stays one line.
+fn preview(s: &str, max: usize) -> String {
+    let one_line: String = s.chars().map(|c| if c == '\n' { '⏎' } else { c }).collect();
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let truncated: String = one_line.chars().take(max).collect();
+        format!("{truncated}…")
+    }
+}
+
+fn log_server_msg(msg: &ServerMsg) {
+    match msg {
+        ServerMsg::Hello {
+            username,
+            server_version,
+        } => eprintln!("[WS<-] Hello username={username} server_v{server_version}"),
+        ServerMsg::Queued { position } => {
+            eprintln!("[WS<-] Queued at position {position}")
+        }
+        ServerMsg::Matched { session_id, role } => {
+            eprintln!("[WS<-] Matched into {session_id} as {role:?}")
+        }
+        ServerMsg::Reconnected { session_id, role } => {
+            eprintln!("[WS<-] Reconnected to {session_id} as {role:?}")
+        }
+        ServerMsg::Spectating { session_id } => {
+            eprintln!("[WS<-] Spectating {session_id}")
+        }
+        ServerMsg::State(view) => {
+            let outcome = if let Some(w) = view.winner {
+                format!(" WINNER={w:?}")
+            } else if view.is_draw {
+                " DRAW".into()
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[WS<-] State turn={} active={:?}{}",
+                view.turn_number, view.current_turn, outcome,
+            );
+        }
+        ServerMsg::Error { message } => eprintln!("[WS<-] Error: {message}"),
+    }
 }
 
 // =================== JSON-RPC over stdio ===================
@@ -995,7 +1098,9 @@ async fn dispatch_tool(
     name: &str,
     args: &Value,
 ) -> Result<String, String> {
-    match name {
+    eprintln!("[TOOL] → {name}");
+    let started = std::time::Instant::now();
+    let result = match name {
         "set_script" => handle_set_script(state, args).await,
         "get_script" => handle_get_script(state).await,
         "on_turn" => handle_on_turn(state, args).await,
@@ -1003,7 +1108,16 @@ async fn dispatch_tool(
         "get_state" => handle_get_state(state).await,
         "wait_for_turn" => handle_wait_for_turn(state, args).await,
         other => Err(format!("unknown tool: {other}")),
+    };
+    let elapsed = started.elapsed().as_millis();
+    match &result {
+        Ok(text) => eprintln!(
+            "[TOOL] ← {name} ok in {elapsed}ms ({} chars)",
+            text.len()
+        ),
+        Err(e) => eprintln!("[TOOL] ← {name} ERR in {elapsed}ms: {}", preview(e, 120)),
     }
+    result
 }
 
 async fn handle_set_script(state: &Arc<HarnessState>, args: &Value) -> Result<String, String> {
@@ -1104,15 +1218,21 @@ async fn handle_wait_for_turn(
     // Fast path: maybe it's already our turn.
     if let Some(view) = state.state.lock().await.clone() {
         if let Some(w) = view.winner {
+            let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
             return Ok(format!(
-                "Game is over. Winner: {:?}. (You: {:?}.)",
-                w, me
+                "GAME OVER. Winner: {w:?} ({outcome}). The harness is still attached to this finished session — \
+                 to play another match you must restart this binary (the MCP doesn't currently support \
+                 in-process re-queueing). Stop accepting tool calls now."
             ));
+        }
+        if view.is_draw {
+            return Ok("GAME OVER (draw — both players idled). Restart the harness binary to play another match.".into());
         }
         if view.current_turn == me {
             return Ok(format!(
-                "It's your turn now (turn {}). Call on_turn next.",
-                view.turn_number
+                "It's your turn now (turn {}, deadline in ~{}s). Call on_turn next.",
+                view.turn_number,
+                view.turn_deadline_secs.saturating_sub(now_secs())
             ));
         }
     }
@@ -1136,15 +1256,19 @@ async fn handle_wait_for_turn(
                 let view = state.state.lock().await.clone();
                 if let Some(v) = view {
                     if let Some(w) = v.winner {
+                        let outcome = if w == me { "YOU WIN" } else { "YOU LOSE" };
                         return Ok(format!(
-                            "Game is over. Winner: {:?}. (You: {:?}.)",
-                            w, me
+                            "GAME OVER. Winner: {w:?} ({outcome}). Restart the harness binary to play another match."
                         ));
+                    }
+                    if v.is_draw {
+                        return Ok("GAME OVER (draw — both players idled). Restart the harness binary to play another match.".into());
                     }
                     if v.current_turn == me {
                         return Ok(format!(
-                            "It's your turn now (turn {}). Call on_turn next.",
-                            v.turn_number
+                            "It's your turn now (turn {}, deadline in ~{}s). Call on_turn next.",
+                            v.turn_number,
+                            v.turn_deadline_secs.saturating_sub(now_secs())
                         ));
                     }
                 }

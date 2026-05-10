@@ -1,0 +1,55 @@
+{
+  "sessionId": "299473de-4f68-41f6-8062-577d0c2b32ac",
+  "mapSeed": 18206122425212302168,
+  "mapGeneratorVersion": 3,
+  "gameVersion": "0.1.0",
+  "startedAt": 1778389385,
+  "endedAt": 1778389485,
+  "players": {
+    "p1": "agent1",
+    "p2": "agent2"
+  },
+  "winner": null,
+  "events": [
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p1"
+    },
+    {
+      "type": "endTurn",
+      "actor": "p2"
+    }
+  ]
+}
